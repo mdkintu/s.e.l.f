@@ -7,11 +7,13 @@
   <meta name="description" content="S.E.L.F is a private, local-first personal finance tracker. No account, no network calls: your data stays on your device.">
   <!--
     The browser itself enforces "nothing leaves the device": connect-src 'none' blocks every
-    fetch/XHR/WebSocket, and scripts may only come from this site plus the Tailwind CDN.
-    Later steps that add a network call (Step 3 model download, Step 4 Supabase) must widen
+    fetch/XHR/WebSocket FROM THIS PAGE, and scripts may only come from this site plus the Tailwind CDN.
+    Step 3's model download does NOT widen this: it runs in a Worker (js/ai-worker.js), which a <meta>
+    policy can't reach, so that file gets its own Content-Security-Policy response header instead
+    (_headers / vercel.json) allowing only huggingface.co. Step 4 (Supabase) will need to widen
     connect-src on purpose. If you edit either of the two inline scripts below, update its sha256 here.
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://cdn.tailwindcss.com 'sha256-Vbx2Z8AVOQF7FX27OSg3OT8hvHPJZLnydcAUrQ8XFmU=' 'sha256-GlbDdvDEo5AcvJCZtLzBbddMMueNEf3d3vlDP8c214Q='; style-src 'self' 'unsafe-inline'; img-src data: blob:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://cdn.tailwindcss.com 'sha256-Vbx2Z8AVOQF7FX27OSg3OT8hvHPJZLnydcAUrQ8XFmU=' 'sha256-GlbDdvDEo5AcvJCZtLzBbddMMueNEf3d3vlDP8c214Q='; style-src 'self' 'unsafe-inline'; worker-src 'self'; img-src data: blob:; connect-src 'none'; base-uri 'none'; form-action 'none'">
   <title>S.E.L.F</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f766e'/%3E%3Ctext x='16' y='22' font-family='sans-serif' font-size='18' font-weight='700' text-anchor='middle' fill='white'%3ES%3C/text%3E%3C/svg%3E">
 
@@ -135,6 +137,7 @@
     <main id="main">
       <section id="view-add" aria-label="Add a transaction"><div id="entry"></div></section>
       <section id="view-month" aria-labelledby="h-month" hidden></section>
+      <section id="view-insights" aria-labelledby="h-insights" hidden></section>
       <section id="view-settings" aria-labelledby="h-settings" hidden></section>
     </main>
   </div>
@@ -144,9 +147,10 @@
 
   <nav id="app-nav" aria-label="Main" class="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 backdrop-blur dark:border-slate-800 dark:bg-slate-900/95"
        style="padding-bottom: env(safe-area-inset-bottom)">
-    <div class="mx-auto grid max-w-2xl grid-cols-3">
+    <div class="mx-auto grid max-w-2xl grid-cols-4">
       <button type="button" class="tab" data-tab="add"><span data-icon="plus" aria-hidden="true"></span>Add</button>
       <button type="button" class="tab" data-tab="month"><span data-icon="calendar" aria-hidden="true"></span>Month</button>
+      <button type="button" class="tab" data-tab="insights"><span data-icon="chart" aria-hidden="true"></span>Insights</button>
       <button type="button" class="tab" data-tab="settings"><span data-icon="cog" aria-hidden="true"></span>Settings</button>
     </div>
   </nav>

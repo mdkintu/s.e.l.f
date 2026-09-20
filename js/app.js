@@ -6,6 +6,8 @@ import * as store from './store.js';
 import * as schema from './schema.js';
 import * as money from './money.js';
 import { passphraseStrength, MIN_PASSPHRASE } from './crypto.js';
+import * as insights from './insights.js';
+import { donutChart, barChart, niceScale } from './charts.js';
 import { buildCsv, download, stamp } from './backup.js';
 
 /* ================================================================== */
@@ -35,6 +37,7 @@ const ICONS = {
   cog: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
   pencil: '<path d="M4 20h4L19 9l-4-4L4 16v4z"/><path d="M13.5 6.5l4 4"/>',
   trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
+  chart: '<path d="M5 20V11M12 20V4M19 20v-6"/>',
   lock: '<rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
   shield: '<path d="M12 3l7 3v6c0 4.6-3 8.3-7 9-4-.7-7-4.4-7-9V6l7-3z"/>',
   up: '<path d="M6 15l6-6 6 6"/>',
@@ -105,6 +108,11 @@ const ui = {
   filterMain: 'all',
   settingsType: 'expense',
   openMains: new Set(),
+  // On-device AI. Held in memory only: a summary holds figures, so it never touches storage.
+  aiCached: null,    // is the model already on this device? (null = not checked yet)
+  aiText: null,      // { signature, text, device, seconds } — valid only for the facts it was written from
+  aiFail: null,      // { message } | { offenders }
+  aiWorking: false,  // a summary is being written (includes loading the model for it)
 };
 let entryForm = null;
 let bootInfo = { persistent: true, recovered: null };
@@ -574,6 +582,384 @@ function wireMonth() {
     if (which === 'type') { ui.filterType = e.target.value; renderMonth(); }
     else if (which === 'main') { ui.filterMain = e.target.value; renderMonth(); }
   });
+}
+
+/* ================================================================== */
+/* Insights: the numbers, the charts, and the optional on-device AI    */
+/* ================================================================== */
+
+// The AI is optional and off until asked for. Constructing the bridge starts nothing: no worker,
+// no runtime file, no network. Everything a person sees here without AI is plain arithmetic.
+const ai = insights.createAiBridge();
+let aiViewDrawn = null;
+let aiSignature = '';
+let aiCanSummarise = false;
+let aiReleaseTimer = 0;
+
+const bytesText = insights.formatBytes;
+const shortMonth = (key) => new Intl.DateTimeFormat(locale, { month: 'short' }).format(dateFromStr(`${key}-01`));
+
+/** '' when this browser can run the model, otherwise the reason it can't. */
+function aiSupport() {
+  if (typeof Worker !== 'function' || typeof WebAssembly !== 'object') return 'This browser can\'t run the on-device AI.';
+  if (!globalThis.caches) return 'The on-device AI needs a secure connection (https, or localhost) so the model can be kept on this device.';
+  return '';
+}
+
+/** Which of the AI card's screens applies right now. */
+function aiView() {
+  const phase = ai.getState().phase;
+  if (aiSupport()) return 'unsupported';
+  if (phase === 'downloading') return 'downloading';
+  if (phase === 'loading') return 'loading';
+  if (ui.aiWorking || phase === 'writing') return 'writing';
+  return phase === 'ready' || ui.aiCached ? 'ready' : 'off';
+}
+
+const wordsSoFar = (tokens) => Math.round(tokens * 0.75);
+
+function insightsData() {
+  const { categories: cats, transactions } = store.getState();
+  const live = transactions.filter((t) => !t.deleted);
+  const code = currencyCode();
+  const facts = insights.computeInsights({ transactions: live, categories: cats, month: ui.month });
+  const realFmt = insights.makeFormatter(code);
+  const realLines = insights.factLines(facts, realFmt);
+  return {
+    cats, live, code, facts, realLines,
+    labels: insights.labelFigures(facts, realFmt, code),
+    canSummarise: insights.groupsOf(realLines).length > 0,
+    signature: insights.factsSignature(realLines),
+  };
+}
+
+/* ---------- the AI card ---------- */
+
+function aiCardInner() {
+  const s = ai.getState();
+  const m = ai.model;
+  const view = aiView();
+  const shown = ui.aiText && ui.aiText.signature === aiSignature && !privacyOn() ? ui.aiText : null;
+  const where = s.device === 'webgpu' ? 'your graphics chip (WebGPU)' : 'your processor (WebAssembly)';
+
+  let body;
+  if (view === 'unsupported') {
+    body = html`<p class="text-sm muted">${aiSupport()}</p>`;
+  } else if (view === 'downloading') {
+    body = html`
+      <div class="space-y-2">
+        <p class="text-sm" id="ai-status" role="status">Downloading the model: <span id="ai-mb">${bytesText(s.loaded)} of ${bytesText(s.total)}</span></p>
+        <progress id="ai-bar" class="h-3 w-full accent-teal-600" max="${s.total}" value="${s.loaded}" aria-labelledby="ai-status"></progress>
+        <p class="text-sm muted">This happens once. You can keep using the app while it downloads.</p>
+        <button type="button" class="btn-secondary" data-act="ai-stop" data-key="ai-stop" data-ai-primary>Cancel download</button>
+      </div>`;
+  } else if (view === 'loading') {
+    body = html`
+      <div class="space-y-2">
+        <p class="text-sm" role="status">Getting the model ready…</p>
+        <button type="button" class="btn-secondary" data-act="ai-stop" data-key="ai-stop" data-ai-primary>Cancel</button>
+      </div>`;
+  } else if (view === 'writing') {
+    body = html`
+      <div class="space-y-2">
+        <p class="text-sm" role="status">Writing your summary… <span id="ai-words" class="muted">${s.tokens ? `about ${wordsSoFar(s.tokens)} words so far` : ''}</span></p>
+        <p class="text-sm muted">On a phone this can take a minute. The rest of the app stays usable.</p>
+        <button type="button" class="btn-secondary" data-act="ai-stop" data-key="ai-stop" data-ai-primary>Stop</button>
+      </div>`;
+  } else if (view === 'ready') {
+    body = html`
+      ${shown ? html`
+        <div class="space-y-2">
+          <p class="text-base leading-relaxed" id="ai-text">${shown.text}</p>
+          <p class="text-sm text-emerald-800 dark:text-emerald-300">✓ Checked: each sentence uses only figures from its own numbers above.</p>
+          ${shown.dropped ? html`<p class="text-sm muted">${plural(shown.dropped, 'sentence')} left out because ${shown.dropped === 1 ? 'it' : 'they'} didn't pass the check.</p>` : ''}
+          <p class="text-xs muted">Written by ${m.name} on ${shown.device === 'webgpu' ? 'your graphics chip' : 'your processor'}, in ${shown.seconds}s. Nothing left this device.</p>
+        </div>` : ''}
+      ${ui.aiFail ? html`
+        <p class="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100" role="status">${
+  ui.aiFail.offenders
+    ? html`The model's sentences didn't match the numbers above (${ui.aiFail.offenders.join('; ')}), so nothing was shown. The numbers above are still right. Try again, or just use them.`
+    : ui.aiFail.message}</p>` : ''}
+      ${privacyOn() ? html`<p class="text-sm muted">Summaries are hidden while Privacy Mode is on, because they contain your amounts.</p>` : ''}
+      ${!aiCanSummarise ? html`<p class="text-sm muted">Nothing to summarise yet. Add a few transactions for this month.</p>` : ''}
+      <div class="flex flex-wrap items-center gap-2">
+        <button type="button" class="btn-primary" data-act="ai-write" data-key="ai-write" data-ai-primary ${privacyOn() || !aiCanSummarise ? 'disabled' : ''}>${shown ? 'Write again' : 'Write summary'}</button>
+        <button type="button" class="btn-link" data-act="ai-remove" data-key="ai-remove">Remove the model (frees ${bytesText(m.downloadBytes)})</button>
+      </div>
+      ${s.device ? html`<p class="text-xs muted">The model is loaded and runs on ${where}.</p>` : ''}`;
+  } else {
+    body = html`
+      <div class="space-y-3">
+        <p class="text-sm muted">Turns the numbers above into a few friendly sentences. It runs on this device, only when you ask, and every figure it writes is checked against the numbers above before you see it.</p>
+        ${ui.aiFail && ui.aiFail.message ? html`<p class="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100" role="status">${ui.aiFail.message}</p>` : ''}
+        <button type="button" class="btn-secondary" data-act="ai-enable" data-key="ai-enable" data-ai-primary>Enable AI insights</button>
+      </div>`;
+  }
+
+  return html`
+    <h3 id="ai-h" tabindex="-1" class="card-title">Plain-language summary <span class="text-sm font-normal muted">(optional)</span></h3>
+    ${body}`;
+}
+
+/** Redraw just the AI card, keeping keyboard focus somewhere sensible if the button it was on went away. */
+function renderAiCard() {
+  const card = $('#ai-card');
+  if (!card || store.isLocked()) return;
+  const hadFocus = document.activeElement === document.body || card.contains(document.activeElement);
+  aiViewDrawn = aiView();
+  put(card, aiCardInner());
+  if (hadFocus) ($('[data-ai-primary]', card) ?? $('#ai-h', card))?.focus({ preventScroll: true });
+}
+
+function wireAiState() {
+  ai.subscribe((s) => {
+    if (!$('#ai-card') || store.isLocked()) return;
+    const view = aiView();
+    if (view !== aiViewDrawn) { renderAiCard(); return; }
+    // Same screen: only the numbers change, so patch them rather than rebuild (and lose focus).
+    if (view === 'downloading') {
+      const bar = $('#ai-bar');
+      if (bar) { bar.max = s.total; bar.value = s.loaded; }
+      const text = $('#ai-mb');
+      if (text) text.textContent = `${bytesText(s.loaded)} of ${bytesText(s.total)}`;
+    } else if (view === 'writing') {
+      const words = $('#ai-words');
+      if (words) words.textContent = s.tokens ? `about ${wordsSoFar(s.tokens)} words so far` : '';
+    }
+  });
+}
+
+async function refreshAiCached() {
+  ui.aiCached = await ai.isCached();
+  if (ui.tab === 'insights') renderAiCard();
+}
+
+/** Free the model's memory after a couple of quiet minutes; it reloads from the cache when next needed. */
+function scheduleAiRelease() {
+  clearTimeout(aiReleaseTimer);
+  aiReleaseTimer = setTimeout(() => {
+    if (!ui.aiWorking && ai.getState().phase === 'ready') ai.terminate();
+  }, 120_000);
+}
+
+async function enableAi() {
+  if (aiSupport()) return;
+  const m = ai.model;
+  const { done } = mountDialog(html`
+    <div class="space-y-4 p-5">
+      <h2 id="dlg-title" class="text-lg font-semibold">Download the on-device AI?</h2>
+      <p class="muted">A small language model that turns your numbers into a few friendly sentences. It runs entirely on this device.</p>
+      <ul class="list-disc space-y-1 pl-5 text-sm">
+        <li><strong>${bytesText(m.downloadBytes)}</strong> once, from Hugging Face (huggingface.co): the ${m.name} model, ${m.license}.</li>
+        <li><strong>${bytesText(m.runtimeBytes)}</strong> once, from this app: the code that runs it.</li>
+      </ul>
+      <p class="text-sm"><strong>${bytesText(m.downloadBytes + m.runtimeBytes)} in total.</strong> It is kept in your browser afterwards, so it works offline and is never downloaded again. Use Wi-Fi if you are on mobile data.</p>
+      <p class="text-sm muted">Nothing about your money is sent anywhere. Hugging Face will see that your device downloaded the model, as any website you visit would.</p>
+      <div class="flex flex-wrap justify-end gap-2">
+        <button type="button" class="btn-secondary" data-close="" autofocus>Not now</button>
+        <button type="button" class="btn-primary" data-close="yes">Download ${bytesText(m.downloadBytes + m.runtimeBytes)}</button>
+      </div>
+    </div>`);
+  if ((await done) !== 'yes') return;
+
+  ui.aiFail = null;
+  renderAiCard();
+  try {
+    await ai.load({ download: true });
+    ui.aiCached = true;
+    if (!store.isLocked()) toast('AI insights are ready. Everything stays on this device.');
+  } catch (err) {
+    if (err.code === 'cancelled') { if (!store.isLocked()) toast('Download cancelled.'); } else ui.aiFail = { message: err.message };
+    ui.aiCached = await ai.isCached();
+  }
+  scheduleAiRelease();
+  renderAiCard();
+}
+
+async function writeAiSummary() {
+  if (privacyOn() || ui.aiWorking) return;
+  const data = insightsData();
+  if (!data.canSummarise) return;
+  const started = performance.now();
+  ui.aiFail = null;
+  ui.aiText = null;
+  ui.aiWorking = true;
+  renderAiCard();
+  try {
+    // A returning visit: load from the cache only. This can never turn into a download.
+    if (ai.getState().phase === 'idle') await ai.load({ download: false });
+    const result = await insights.writeSummary({ lines: data.realLines, labels: data.labels, bridge: ai, currency: data.code });
+    if (store.isLocked()) return;
+    if (result.ok) {
+      ui.aiText = { signature: data.signature, text: result.text, dropped: result.dropped.length, device: ai.getState().device, seconds: Math.max(1, Math.round((performance.now() - started) / 1000)) };
+    } else {
+      ui.aiFail = result.reason === 'figures' ? { offenders: result.offenders } : { message: 'The model didn\'t produce a usable summary. Try again.' };
+    }
+  } catch (err) {
+    if (err.code === 'not-cached') { ui.aiCached = false; ui.aiFail = { message: err.message }; }
+    else if (err.code !== 'cancelled') ui.aiFail = { message: err.message };
+  } finally {
+    ui.aiWorking = false;
+    if (!store.isLocked()) { scheduleAiRelease(); renderAiCard(); }
+  }
+}
+
+async function removeAiModel() {
+  const m = ai.model;
+  if (!(await confirmDialog({
+    title: 'Remove the AI model?',
+    message: `This frees about ${bytesText(m.downloadBytes)}. You can download it again whenever you like. Your numbers, charts and backups are not affected.`,
+    confirmLabel: 'Remove model',
+    danger: true,
+  }))) return;
+  await ai.removeModel();
+  ui.aiCached = false;
+  ui.aiText = null;
+  ui.aiFail = null;
+  renderAiCard();
+  toast('AI model removed');
+}
+
+/** A lock forgets everything decrypted. A summary in progress holds figures, so it stops; a model download holds none, so it carries on. */
+function releaseAiForLock() {
+  clearTimeout(aiReleaseTimer);
+  ui.aiText = null;
+  ui.aiFail = null;
+  if (ui.aiWorking) ai.terminate();
+  ui.aiWorking = false;
+}
+
+/* ---------- the charts ---------- */
+
+const chartCard = (title, body, note = '') => html`
+  <section class="card" aria-label="${title}">
+    <h3 class="card-title">${title}</h3>
+    ${body}
+    ${note ? html`<p class="mt-2 text-xs muted">${note}</p>` : ''}
+  </section>`;
+
+function donutCard(d) {
+  const { facts, cats, code } = d;
+  const hide = privacyOn();
+  if (!facts.byMain.length) return chartCard('Spending by category', html`<p class="text-sm muted">No spending in ${fmtMonth.format(dateFromStr(`${ui.month}-01`))} yet.</p>`);
+
+  const slices = facts.byMain.map((c) => ({
+    name: c.name, value: c.amount, color: schema.findMain(cats, c.id)?.color,
+    valueText: money.formatMoney(c.amount, code), sharePct: c.pct,
+  }));
+  const svg = donutChart({
+    slices, showValues: !hide, totalText: money.formatMoney(facts.totals.spending, code), caption: 'spent',
+    ariaLabel: `Spending by category: ${slices.map((s) => `${s.name} ${s.sharePct}%`).join(', ')}`,
+  });
+  return chartCard('Spending by category', html`
+    <div class="grid items-center gap-4 sm:grid-cols-2">
+      <div class="text-slate-700 dark:text-slate-300">${new Safe(svg)}</div>
+      <ul class="space-y-1 text-sm">
+        ${slices.map((s) => html`
+          <li class="flex min-h-8 items-center gap-2">
+            <span class="h-3 w-3 shrink-0 rounded-full" style="background: ${s.color}" aria-hidden="true"></span>
+            <span class="min-w-0 flex-1 break-words">${s.name}</span>
+            <span class="tabular-nums muted">${amountHtml(s.value)}</span>
+            <span class="w-10 text-right font-medium tabular-nums">${s.sharePct}%</span>
+          </li>`)}
+      </ul>
+    </div>`,
+  `Savings & investments (${hide ? 'hidden' : money.formatMoney(facts.totals.savings, code)}) are counted apart from spending.`);
+}
+
+function barsCard(d) {
+  const { live, cats, code } = d;
+  const hide = privacyOn();
+  const keys = Array.from({ length: 6 }, (_, i) => insights.shiftMonth(ui.month, i - 5));
+  const rows = keys.map((key) => {
+    const totals = schema.summarize(live.filter((t) => monthOf(t.date) === key), cats);
+    return { key, income: totals.income, expenses: totals.spending };
+  });
+  const top = Math.max(...rows.flatMap((r) => [r.income, r.expenses]));
+  if (top <= 0) return chartCard('Income and expenses, last 6 months', html`<p class="text-sm muted">Nothing logged in these six months yet.</p>`);
+
+  const scale = niceScale(top);
+  const svg = barChart({
+    groups: rows.map((r) => ({ label: shortMonth(r.key), values: [r.income, r.expenses], valueTexts: [money.formatMoney(r.income, code), money.formatMoney(r.expenses, code)] })),
+    series: [{ name: 'Income', color: '#0d9488' }, { name: 'Expenses', color: '#e11d48' }],
+    ticks: scale.ticks.map((value) => ({ value, label: money.formatCompact(value, code) })),
+    max: scale.max,
+    showValues: !hide,
+    ariaLabel: `Income and expenses for ${fmtMonth.format(dateFromStr(`${keys[0]}-01`))} to ${fmtMonth.format(dateFromStr(`${keys[5]}-01`))}. The table below has the figures.`,
+  });
+  return chartCard('Income and expenses, last 6 months', html`
+    <div class="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-sm" aria-hidden="true">
+      <span class="flex items-center gap-1.5"><span class="h-3 w-3 rounded-sm" style="background:#0d9488"></span>Income</span>
+      <span class="flex items-center gap-1.5"><span class="h-3 w-3 rounded-sm" style="background:#e11d48"></span>Expenses</span>
+    </div>
+    <div class="text-slate-700 dark:text-slate-300">${new Safe(svg)}</div>
+    <details class="mt-2">
+      <summary class="btn-link">Show as a table</summary>
+      <div class="overflow-x-auto">
+        <table class="mt-2 w-full text-sm">
+          <thead><tr class="text-left muted"><th class="py-1 pr-3 font-medium">Month</th><th class="py-1 pr-3 text-right font-medium">Income</th><th class="py-1 text-right font-medium">Expenses</th></tr></thead>
+          <tbody>${rows.map((r) => html`<tr class="border-t border-slate-200 dark:border-slate-800"><td class="py-1 pr-3">${fmtMonth.format(dateFromStr(`${r.key}-01`))}</td><td class="py-1 pr-3 text-right tabular-nums">${amountHtml(r.income)}</td><td class="py-1 text-right tabular-nums">${amountHtml(r.expenses)}</td></tr>`)}</tbody>
+        </table>
+      </div>
+    </details>`,
+  `Expenses don't include Savings & investments.${hide ? '' : ` Amounts in ${code}.`}`);
+}
+
+/* ---------- the view ---------- */
+
+function insightsHtml() {
+  const d = insightsData();
+  aiSignature = d.signature;
+  aiCanSummarise = d.canSummarise;
+  const months = [...d.live.map((t) => monthOf(t.date)), monthOf(todayStr()), ui.month].sort();
+  const [first, last] = [months[0], months.at(-1)];
+  // Facts as the person sees them: amounts masked in Privacy Mode. The model is never shown these
+  // (it gets the unmasked list, and only ever runs when Privacy Mode is off).
+  const shownLines = insights.factLines(d.facts, insights.makeFormatter(d.code, { masked: privacyOn() }));
+
+  return html`
+    <div class="space-y-4">
+      <h2 id="h-insights" tabindex="-1" class="text-lg font-semibold">Insights</h2>
+      <div class="flex items-center justify-between">
+        <button type="button" class="icon-btn" data-act="ins-prev" data-key="ins-prev" aria-label="Previous month" ${ui.month <= first ? 'disabled' : ''}>${icon('left')}</button>
+        <p class="text-lg font-semibold" aria-live="polite">${fmtMonth.format(dateFromStr(`${ui.month}-01`))}</p>
+        <button type="button" class="icon-btn" data-act="ins-next" data-key="ins-next" aria-label="Next month" ${ui.month >= last ? 'disabled' : ''}>${icon('right')}</button>
+      </div>
+
+      <section class="card" aria-labelledby="ins-facts-h">
+        <h3 id="ins-facts-h" class="card-title">The numbers</h3>
+        <ul class="list-disc space-y-1.5 pl-5 text-sm">${shownLines.map((l) => html`<li>${l.text}</li>`)}</ul>
+        <p class="mt-3 text-xs muted">Worked out on this device from your transactions, with plain arithmetic. Savings & investments are counted apart from spending.</p>
+      </section>
+
+      <section id="ai-card" class="card space-y-3" aria-labelledby="ai-h">${aiCardInner()}</section>
+
+      ${donutCard(d)}
+      ${barsCard(d)}
+    </div>`;
+}
+
+function renderInsights() {
+  const root = $('#view-insights');
+  withFocus(root, () => { put(root, insightsHtml()); aiViewDrawn = aiView(); });
+}
+
+function wireInsights() {
+  const root = $('#view-insights');
+  root.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-act]');
+    if (!btn || btn.disabled) return;
+    switch (btn.dataset.act) {
+      case 'ins-prev': ui.month = shiftMonth(ui.month, -1); renderInsights(); break;
+      case 'ins-next': ui.month = shiftMonth(ui.month, 1); renderInsights(); break;
+      case 'ai-enable': await enableAi(); break;
+      case 'ai-write': await writeAiSummary(); break;
+      case 'ai-stop': ai.interrupt(); break;
+      case 'ai-remove': await removeAiModel(); break;
+      default: break;
+    }
+  });
+  wireAiState();
 }
 
 /* ================================================================== */
@@ -1540,7 +1926,8 @@ function wireAutoLock() {
 function teardownLedger() {
   entryForm = null;
   hideToast();
-  for (const id of ['#entry', '#view-month', '#view-settings', '#banner']) $(id).replaceChildren();
+  releaseAiForLock();
+  for (const id of ['#entry', '#view-month', '#view-insights', '#view-settings', '#banner']) $(id).replaceChildren();
   for (const dlg of document.querySelectorAll('dialog[open]')) dlg.close('');
 }
 
@@ -1618,16 +2005,18 @@ function renderAll() {
   // Views that are not on screen are emptied rather than left stale: showTab() redraws them on demand,
   // and it keeps amounts from lingering in hidden DOM after Privacy Mode is switched on.
   if (ui.tab === 'month') renderMonth(); else $('#view-month').replaceChildren();
+  if (ui.tab === 'insights') renderInsights(); else $('#view-insights').replaceChildren();
   if (ui.tab === 'settings') renderSettings(); else $('#view-settings').replaceChildren();
 }
 
 function showTab(tab, { focus = true } = {}) {
   ui.tab = tab;
-  for (const name of ['add', 'month', 'settings']) $(`#view-${name}`).hidden = name !== tab;
+  for (const name of ['add', 'month', 'insights', 'settings']) $(`#view-${name}`).hidden = name !== tab;
   for (const btn of document.querySelectorAll('[data-tab]')) {
     if (btn.dataset.tab === tab) btn.setAttribute('aria-current', 'page'); else btn.removeAttribute('aria-current');
   }
   if (tab === 'month') renderMonth();
+  if (tab === 'insights') { renderInsights(); refreshAiCached(); }
   if (tab === 'settings') renderSettings();
   $('#toast').style.bottom = `calc(${tab === 'add' ? '9.25rem' : '5rem'} + env(safe-area-inset-bottom))`;
   if (focus) {
@@ -1667,6 +2056,7 @@ async function start() {
   bootInfo = store.init();
   wireShell();
   wireMonth();
+  wireInsights();
   wireSettings();
   wireImport();
   wireLock();

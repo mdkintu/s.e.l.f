@@ -106,13 +106,13 @@ const codeOf = (file) => readFileSync(new URL(`../js/${file}`, import.meta.url),
   .replace(/^\s*\/\/.*$/gm, '');
 
 test('no module uses Math.random for anything', () => {
-  for (const file of ['crypto.js', 'store.js', 'schema.js', 'app.js']) {
+  for (const file of ['crypto.js', 'store.js', 'schema.js', 'app.js', 'insights.js', 'charts.js', 'ai-worker.js']) {
     assert.equal(/Math\s*\.\s*random/.test(codeOf(file)), false, `${file} must not use Math.random`);
   }
 });
 
 test('no module logs to the console', () => {
-  for (const file of ['crypto.js', 'store.js', 'app.js']) {
+  for (const file of ['crypto.js', 'store.js', 'app.js', 'insights.js', 'charts.js', 'ai-worker.js']) {
     assert.equal(/console\s*\.\s*(log|debug|info|warn|error|trace|dir)/.test(codeOf(file)), false, `${file} must not log`);
   }
 });

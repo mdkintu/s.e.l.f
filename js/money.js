@@ -92,6 +92,16 @@ export function formatMoney(minor, code) {
 }
 
 /**
+ * Short form for chart axes: 1250000 UGX → "1.3M". No symbol (the chart names the currency once).
+ * Intl reads the exact decimal string, so no float division happens on the way.
+ */
+export function formatCompact(minor, code) {
+  const { decimals } = currencyInfo(code);
+  return makeFormat(userLocale(), { notation: 'compact', maximumFractionDigits: 1 })
+    .format(minorToDecimalString(minor, decimals));
+}
+
+/**
  * Parse what a person typed into integer minor units, using string maths (no floats).
  * Returns { minor } or { error } where error is one of:
  *   empty | invalid | no-decimals | too-many-decimals | zero | too-large

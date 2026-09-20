@@ -1,0 +1,11 @@
+# Netlify. Applies a Content-Security-Policy to the AI worker only.
+#
+# The page's own policy is a <meta> tag (index.html). A meta policy does NOT reach a Worker that
+# is loaded from a URL, so without this the worker's network access would be limited only by the
+# guard inside ai-worker.js. This header makes the BROWSER enforce the same rule: the worker may
+# talk to this site and to the Hugging Face model host, and nothing else.
+#
+# 'wasm-unsafe-eval' is required to run WebAssembly. Keep the hosts in step with MODEL_HOSTS in
+# js/ai-worker.js. (Vercel reads vercel.json instead; the two must say the same thing.)
+/js/ai-worker.js
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' https://huggingface.co https://*.hf.co; base-uri 'none'
