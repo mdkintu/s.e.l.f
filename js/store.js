@@ -22,7 +22,7 @@ import {
 import { DEFAULT_CURRENCY, isCurrencyCode, currencyInfo, rescale } from './money.js';
 import * as vault from './crypto.js';
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 export class StoreError extends Error {}
 
 const KEY = 'self.data';
@@ -78,6 +78,14 @@ const MIGRATIONS = {
     settings: d.settings ?? {},
     transactions: (d.transactions ?? []).map((t) => ({ deleted: false, ...t })),
   }),
+  // 1 → 2: Step 4 sync. The category tree and the settings become syncable items, so they each
+  // need an "edited at" of their own; transactions already had one. Stamping them with the time of
+  // the migration (rather than the epoch) means a device that syncs later offers a real timestamp
+  // to compare against, instead of losing every conflict by default.
+  1: (d) => {
+    const stamp = nowIso();
+    return { ...d, schemaUpdatedAt: d.schemaUpdatedAt ?? stamp, settingsUpdatedAt: d.settingsUpdatedAt ?? stamp };
+  },
 };
 
 /** Bring a parsed document up to SCHEMA_VERSION. Refuses documents from a newer app. */
@@ -152,12 +160,42 @@ function cleanSettings(raw = {}) {
     theme: THEMES.includes(raw.theme) ? raw.theme : 'system',
     autoLockMinutes: AUTO_LOCK_CHOICES.includes(raw.autoLockMinutes) ? raw.autoLockMinutes : 5,
     encryptionSkipped: raw.encryptionSkipped === true,
+    syncBannerDismissed: raw.syncBannerDismissed === true,
+  };
+}
+
+// Of the settings, only these describe the LEDGER rather than this device, so only these sync.
+// Theme, auto-lock, privacy mode and the two "don't ask me again" flags stay where they were set.
+const SYNCED_SETTINGS = ['currency', 'currencyConfirmed'];
+
+const ISO_EPOCH = '1970-01-01T00:00:00.000Z';
+
+/** Per-device sync bookkeeping. Lives inside the encrypted document, never on disk in the clear. */
+function cleanSync(raw = {}) {
+  const id = (v) => (typeof v === 'string' && v ? v : null);
+  return {
+    userId: id(raw.userId),
+    email: id(raw.email),
+    session: raw.session && typeof raw.session === 'object' ? raw.session : null,
+    lastPulledAt: id(raw.lastPulledAt),
+    lastSyncAt: id(raw.lastSyncAt),
+    // The offline queue: item ids (plus the sentinels 'schema' and 'settings') waiting to go up.
+    dirty: Array.isArray(raw.dirty) ? [...new Set(raw.dirty.filter((x) => typeof x === 'string'))] : [],
+    // The row ids this device uses for the one-per-account items.
+    schemaRowId: id(raw.schemaRowId),
+    settingsRowId: id(raw.settingsRowId),
+    keyRowId: id(raw.keyRowId),
   };
 }
 
 /** Validate a migrated document. Bad transactions are skipped (and reported), not fatal. */
 function normalize(data) {
   const settings = cleanSettings(data.settings);
+  const stamps = {
+    schemaUpdatedAt: asIso(data.schemaUpdatedAt, ISO_EPOCH),
+    settingsUpdatedAt: asIso(data.settingsUpdatedAt, ISO_EPOCH),
+    sync: cleanSync(data.sync),
+  };
   const categories = data.categories === undefined ? defaultCategories() : sanitizeCategories(data.categories);
   const transactions = [];
   const skipped = [];
@@ -170,12 +208,15 @@ function normalize(data) {
     seen.add(tx.id);
     transactions.push(tx);
   }
-  return { data: { schemaVersion: SCHEMA_VERSION, settings, categories, transactions }, skipped };
+  return { data: { schemaVersion: SCHEMA_VERSION, settings, ...stamps, categories, transactions }, skipped };
 }
 
 const freshState = () => ({
   schemaVersion: SCHEMA_VERSION,
   settings: cleanSettings(),
+  schemaUpdatedAt: ISO_EPOCH,
+  settingsUpdatedAt: ISO_EPOCH,
+  sync: cleanSync(),
   categories: defaultCategories(),
   transactions: [],
 });
@@ -315,6 +356,15 @@ export const getWriteError = () => writeError;
  */
 function requireOpen() {
   if (locked || !state) throw new StoreError('The ledger is locked.');
+}
+
+/**
+ * Add items to the offline queue on the way to being saved. `ids` are transaction ids, or the
+ * sentinels 'schema' / 'settings' / 'keyinfo' for the one-per-account items.
+ */
+function touch(next, ids) {
+  if (!ids.length || !next.sync) return next;
+  return { ...next, sync: { ...next.sync, dirty: [...new Set([...next.sync.dirty, ...ids])] } };
 }
 
 /** Swap in a new state, persist it, and tell listeners. If saving fails the old state is kept. */
@@ -481,7 +531,10 @@ export async function changePassphrase(current, next) {
     envelope = env;
     if (!locked) key = fresh;
     clearFailures();
-    notify();
+    // Every cloud row was sealed with the OLD key, so nothing up there can still be read. They all
+    // have to be sealed again and re-uploaded, the key's own row first.
+    if (state?.sync?.userId) commit(touch(state, [...state.transactions.map((t) => t.id), 'schema', 'settings', 'keyinfo']));
+    else notify();
   } catch (err) {
     if (previous != null) { try { localStorage.setItem(VAULT_KEY, previous); } catch { /* keep going */ } }
     throw asStoreError(err);
@@ -542,7 +595,11 @@ export const failedAttempts = () => readLockout().fails;
 export function updateSettings(patch) {
   requireOpen();
   const settings = cleanSettings({ ...state.settings, ...patch });
-  commit({ ...state, settings });
+  // Only a change to a SYNCED setting is worth sending anywhere: switching the theme or the
+  // auto-lock on this device is nobody else's business.
+  const changed = SYNCED_SETTINGS.some((k) => settings[k] !== state.settings[k]);
+  const next = changed ? { ...state, settings, settingsUpdatedAt: nowIso() } : { ...state, settings };
+  commit(touch(next, changed ? ['settings'] : []));
 }
 
 /** What changing currency would do — used to warn before it happens. Counts visible transactions. */
@@ -575,7 +632,13 @@ export function changeCurrency(code) {
     if (!Number.isSafeInteger(minor)) throw new StoreError('An amount is too large to relabel in that currency.');
     return { ...t, amount: minor, currency: code, updatedAt: stamp };
   });
-  commit({ ...state, settings: { ...state.settings, currency: code, currencyConfirmed: true }, transactions });
+  // Every amount was rewritten, so every transaction has to go up again, and so do the settings.
+  commit(touch({
+    ...state,
+    settings: { ...state.settings, currency: code, currencyConfirmed: true },
+    settingsUpdatedAt: stamp,
+    transactions,
+  }, [...transactions.map((t) => t.id), 'settings']));
 }
 
 /* ------------------------------------------------------------------ */
@@ -585,7 +648,7 @@ export function changeCurrency(code) {
 /** Persist a tree produced by the schema.js editors. */
 export function saveCategories(categories) {
   requireOpen();
-  commit({ ...state, categories: sanitizeCategories(categories) });
+  commit(touch({ ...state, categories: sanitizeCategories(categories), schemaUpdatedAt: nowIso() }, ['schema']));
 }
 
 /* ------------------------------------------------------------------ */
@@ -617,7 +680,7 @@ export function addTransaction(input) {
   const { tx, reason } = cleanTransaction(candidate);
   if (!tx) throw new StoreError(`Could not save: ${reason}.`);
   checkCategory(tx);
-  commit({ ...state, transactions: [...state.transactions, tx] });
+  commit(touch({ ...state, transactions: [...state.transactions, tx] }, [tx.id]));
   return tx;
 }
 
@@ -629,7 +692,7 @@ export function updateTransaction(id, patch) {
   if (!tx) throw new StoreError(`Could not save: ${reason}.`);
   tx.note = tx.note.trim();
   checkCategory(tx);
-  commit({ ...state, transactions: state.transactions.map((t) => (t.id === id ? tx : t)) });
+  commit(touch({ ...state, transactions: state.transactions.map((t) => (t.id === id ? tx : t)) }, [tx.id]));
   return tx;
 }
 
@@ -637,15 +700,204 @@ function setDeleted(id, deleted) {
   requireOpen();
   if (!state.transactions.some((t) => t.id === id)) throw new StoreError('That transaction no longer exists.');
   const stamp = nowIso();
-  commit({
+  commit(touch({
     ...state,
     transactions: state.transactions.map((t) => (t.id === id ? { ...t, deleted, updatedAt: stamp } : t)),
-  });
+  }, [id]));
 }
 
 /** Soft delete: the record stays (flagged) so sync can propagate the deletion later. */
 export const deleteTransaction = (id) => setDeleted(id, true);
 export const restoreTransaction = (id) => setDeleted(id, false);
+
+/* ------------------------------------------------------------------ */
+/* Sync (Step 4): sealed items in, sealed items out                    */
+/* ------------------------------------------------------------------ */
+//
+// The key never leaves this module. sync.js asks for items and gets ciphertext; it hands back
+// ciphertext and this is where it is opened. Anything that arrives sealed with a different key is
+// counted and ignored, never guessed at.
+
+/** This device's sync bookkeeping. Read-only; change it with setSyncState. */
+export const getSyncState = () => (state?.sync ? { ...state.sync } : cleanSync());
+
+/** Record sync progress. Never marks anything dirty: this is device state, not ledger data. */
+export function setSyncState(patch) {
+  requireOpen();
+  commit({ ...state, sync: cleanSync({ ...state.sync, ...patch }) });
+}
+
+/** Queue every item for upload — a first sign-in, or after a re-key made the cloud unreadable. */
+export function markAllDirty() {
+  requireOpen();
+  commit(touch(state, [...state.transactions.map((t) => t.id), 'schema', 'settings', ...(mode === 'encrypted' ? ['keyinfo'] : [])]));
+}
+
+/** Drop items from the queue once the server has them. */
+export function clearDirty(ids) {
+  requireOpen();
+  const done = new Set(ids);
+  commit({ ...state, sync: { ...state.sync, dirty: state.sync.dirty.filter((id) => !done.has(id)) } });
+}
+
+/** The salt and sealed check value another device needs to derive this same key. */
+export function getKeyInfo() {
+  if (mode !== 'encrypted' || locked || !envelope) return null;
+  return { salt: envelope.salt, check: envelope.check, version: envelope.schemaVersion };
+}
+
+/**
+ * Take on the key an account was set up with. Used on a new device, and on a device whose own
+ * passphrase differs from the account's. The ledger here is re-sealed under that key, so from then
+ * on there is one key for this account everywhere.
+ */
+export async function adoptCloudKey(passphrase, keyInfo) {
+  requireOpen();
+  if (!persistent) throw new StoreError('This browser is blocking storage, so sync cannot be set up.');
+  if (!keyInfo?.salt || !keyInfo?.check) throw new StoreError('That account has no key information to join.');
+  // Version 1 is the only envelope there has ever been; a future one would need its own column.
+  const version = keyInfo.version ?? vault.VAULT_VERSION;
+  const doc = state;
+  const previous = readRaw(VAULT_KEY);
+  try {
+    const candidate = await vault.deriveKey(passphrase, keyInfo.salt, version);
+    if (!(await vault.checkKey(candidate, keyInfo.check))) throw new StoreError('Incorrect passphrase for this account.');
+    const sealed = await vault.seal(candidate, doc, version);
+    const env = { schemaVersion: version, salt: keyInfo.salt, check: keyInfo.check, ...sealed };
+    writeRaw(VAULT_KEY, JSON.stringify(env));
+    await verifyVault(passphrase, doc);
+    removeRaw(KEY);
+    mode = 'encrypted';
+    locked = false;
+    damaged = false;
+    key = candidate;
+    envelope = env;
+    clearFailures();
+    // Whatever was already on this device now belongs to the account, so it all goes up.
+    markAllDirty();
+  } catch (err) {
+    if (previous != null) { try { localStorage.setItem(VAULT_KEY, previous); } catch { /* keep going */ } }
+    else if (mode !== 'encrypted') removeRaw(VAULT_KEY);
+    throw asStoreError(err);
+  }
+}
+
+/** What a transaction row carries. The whole record, so a pull restores it exactly. */
+const payloadOf = (id) => {
+  if (id === 'schema') return { kind: 'schema', payload: { updatedAt: state.schemaUpdatedAt, categories: state.categories }, updatedAt: state.schemaUpdatedAt, deleted: false };
+  if (id === 'settings') {
+    const picked = Object.fromEntries(SYNCED_SETTINGS.map((k) => [k, state.settings[k]]));
+    return { kind: 'settings', payload: { updatedAt: state.settingsUpdatedAt, settings: picked }, updatedAt: state.settingsUpdatedAt, deleted: false };
+  }
+  const tx = state.transactions.find((t) => t.id === id);
+  return tx ? { kind: 'transaction', payload: tx, updatedAt: tx.updatedAt, deleted: tx.deleted } : null;
+};
+
+/** A stable row id per account for the one-per-account items, made once and remembered. */
+function rowIdFor(sentinel) {
+  const field = { schema: 'schemaRowId', settings: 'settingsRowId', keyinfo: 'keyRowId' }[sentinel];
+  let id = state.sync[field];
+  if (!id) {
+    id = newId();
+    commit({ ...state, sync: { ...state.sync, [field]: id } });
+  }
+  return id;
+}
+
+/**
+ * Everything waiting to go up, sealed and ready to upload.
+ * → [{ queueKey, id, kind, iv, ciphertext, salt?, updatedAt, deleted }]
+ *
+ * `queueKey` is what the item is called in the queue and `id` is its row id on the server. For a
+ * transaction they are the same uuid; for the one-per-account items the queue says 'schema' while
+ * the row has an id of its own, and clearing the queue has to use the former.
+ */
+export async function collectDirtyItems() {
+  requireOpen();
+  if (mode !== 'encrypted' || !key) throw new StoreError('Sync needs a passphrase.');
+  const out = [];
+  for (const sentinel of state.sync.dirty) {
+    if (sentinel === 'keyinfo') {
+      // Not a sealed payload: the check value IS the ciphertext, and the salt travels beside it.
+      out.push({ queueKey: 'keyinfo', id: rowIdFor('keyinfo'), kind: 'keyinfo', iv: envelope.check.iv, ciphertext: envelope.check.ciphertext, salt: envelope.salt, updatedAt: nowIso(), deleted: false });
+      continue;
+    }
+    const item = payloadOf(sentinel);
+    if (!item) continue; // queued then hard-removed: nothing to send
+    const sealed = await vault.seal(key, item.payload, envelope.schemaVersion);
+    const id = sentinel === 'schema' || sentinel === 'settings' ? rowIdFor(sentinel) : sentinel;
+    out.push({ queueKey: sentinel, id, kind: item.kind, ...sealed, updatedAt: item.updatedAt, deleted: item.deleted });
+  }
+  return out;
+}
+
+/**
+ * Merge rows pulled from the server. Newest updatedAt wins, per item.
+ *
+ * The timestamp used for that decision comes from INSIDE the ciphertext, not from the row's
+ * plaintext `updated_at` column: the sealed copy is the one AES-GCM guarantees nobody edited.
+ * → { applied, kept, unreadable }
+ */
+export async function applyRemoteItems(rows) {
+  requireOpen();
+  if (mode !== 'encrypted' || !key) throw new StoreError('Sync needs a passphrase.');
+
+  let next = state;
+  let applied = 0;
+  let kept = 0;
+  let unreadable = 0;
+  const overwritten = new Set(); // local items a newer remote version replaced
+
+  const opened = [];
+  for (const row of rows) {
+    if (row.kind === 'keyinfo') continue; // the salt and check value: nothing to merge in
+    try {
+      opened.push({ kind: row.kind, payload: await vault.open(key, row.iv, row.ciphertext) });
+    } catch {
+      unreadable += 1; // sealed with a different key, or damaged in transit
+    }
+  }
+
+  // Settings first, then the tree, then transactions. A batch can carry a currency change AND the
+  // transactions relabelled by it; taking them in this order means the transactions are judged
+  // against the currency they arrived with, not the one being replaced.
+  const order = { settings: 0, schema: 1, transaction: 2 };
+  opened.sort((x, y) => (order[x.kind] ?? 9) - (order[y.kind] ?? 9));
+
+  const byId = new Map(next.transactions.map((t) => [t.id, t]));
+  for (const { kind, payload } of opened) {
+    if (kind === 'settings') {
+      if (!payload?.updatedAt || payload.updatedAt <= next.settingsUpdatedAt) { kept += 1; continue; }
+      const picked = Object.fromEntries(SYNCED_SETTINGS.filter((k) => k in (payload.settings ?? {})).map((k) => [k, payload.settings[k]]));
+      next = { ...next, settings: cleanSettings({ ...next.settings, ...picked }), settingsUpdatedAt: payload.updatedAt };
+      applied += 1;
+    } else if (kind === 'schema') {
+      if (!payload?.updatedAt || payload.updatedAt <= next.schemaUpdatedAt) { kept += 1; continue; }
+      try {
+        next = { ...next, categories: sanitizeCategories(payload.categories), schemaUpdatedAt: payload.updatedAt };
+        applied += 1;
+      } catch { unreadable += 1; }
+    } else if (kind === 'transaction') {
+      const { tx } = cleanTransaction(payload);
+      if (!tx || tx.currency !== next.settings.currency) { unreadable += 1; continue; }
+      const mine = byId.get(tx.id);
+      // Newest updatedAt wins. A tie keeps what is here, so pulling back what we just pushed is a
+      // no-op, and a local item that wins stays queued and goes up on the next push.
+      if (mine && mine.updatedAt >= tx.updatedAt) { kept += 1; continue; }
+      byId.set(tx.id, tx);
+      overwritten.add(tx.id);
+      applied += 1;
+    }
+  }
+
+  if (applied) {
+    // Anything replaced by a newer remote version no longer needs sending: this IS that version.
+    const dirty = next.sync.dirty.filter((id) => !overwritten.has(id));
+    next = { ...next, transactions: [...byId.values()], sync: { ...next.sync, dirty } };
+    commit(next);
+  }
+  return { applied, kept, unreadable };
+}
 
 /* ------------------------------------------------------------------ */
 /* Backup: export, validate, preview, import                           */
@@ -659,8 +911,13 @@ export function exportBackup() {
     schemaVersion: SCHEMA_VERSION,
     exportedAt: nowIso(),
     settings: state.settings,
+    // Carried so a restored backup keeps its place in a sync conflict instead of losing every one.
+    schemaUpdatedAt: state.schemaUpdatedAt,
+    settingsUpdatedAt: state.settingsUpdatedAt,
     categories: state.categories,
     transactions: state.transactions,
+    // `sync` is deliberately absent: it holds this device's Supabase session. A backup file is
+    // not encrypted, and an access token in a downloaded .json would be a real leak.
   };
 }
 
@@ -765,13 +1022,23 @@ export function previewImport({ backup, skipped, exportedAt }) {
  */
 export function applyImport({ backup }, mode_) {
   requireOpen();
+  // Either way the ledger here changes, so everything is queued for upload. Restored items keep
+  // their original timestamps, so an old backup loses to a newer cloud copy rather than clobbering it.
+  const everything = (doc) => [...doc.transactions.map((t) => t.id), 'schema', 'settings'];
+
   if (mode_ === 'replace') {
-    commit({
+    const next = {
       schemaVersion: SCHEMA_VERSION,
       settings: { ...cleanSettings(backup.settings), currencyConfirmed: true },
+      schemaUpdatedAt: backup.schemaUpdatedAt ?? ISO_EPOCH,
+      settingsUpdatedAt: backup.settingsUpdatedAt ?? ISO_EPOCH,
+      // This device's own sync bookkeeping survives a restore: the person is still signed in, and
+      // the backup file deliberately carries no session of its own.
+      sync: state.sync,
       categories: backup.categories,
       transactions: backup.transactions,
-    });
+    };
+    commit(touch(next, everything(next)));
     return;
   }
   if (mode_ !== 'merge') throw new StoreError('Unknown import mode.');
@@ -784,14 +1051,18 @@ export function applyImport({ backup }, mode_) {
     if (!mine || t.updatedAt > mine.updatedAt) byId.set(t.id, t);
   }
   const adoptCurrency = state.transactions.length === 0;
-  commit({
+  const laterOf = (a, b) => (a > b ? a : b);
+  const next = {
     ...state,
     settings: {
       ...state.settings,
       currency: adoptCurrency ? backup.settings.currency : state.settings.currency,
       currencyConfirmed: true,
     },
+    settingsUpdatedAt: laterOf(state.settingsUpdatedAt, backup.settingsUpdatedAt ?? ISO_EPOCH),
+    schemaUpdatedAt: laterOf(state.schemaUpdatedAt, backup.schemaUpdatedAt ?? ISO_EPOCH),
     categories: mergeCategories(state.categories, backup.categories),
     transactions: [...byId.values()],
-  });
+  };
+  commit(touch(next, everything(next)));
 }

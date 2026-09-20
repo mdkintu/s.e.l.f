@@ -6,7 +6,7 @@ A private, local-first personal finance tracker.
 - **You own your data.** It lives in your browser. Nothing leaves the device unless you export it.
 - **A calm utility.** No streaks, no shaming, no social features, no bank syncing, no live market data, no notifications.
 
-This repo is at **Step 3**: the core app, encrypted at rest, with charts and optional private, on-device AI insights. The last step adds optional sync (4).
+This repo is **complete through Step 4**: the core app, encrypted at rest, with charts, optional on-device AI insights, and optional end-to-end encrypted sync across devices. Every step after the first is opt-in, and the app works fully without any of them.
 
 ## Run it
 
@@ -39,11 +39,18 @@ Deploy by uploading the files as-is to Vercel or Netlify.
 | `js/ai-worker.js` | **Step 3.** Runs the model in a Web Worker so the UI never freezes. The only file that touches the network for AI |
 | `js/charts.js` | **Step 3.** Hand-built SVG donut and bar charts. Pure functions, no library |
 | `vendor/transformers/` | **Step 3.** Transformers.js and its WebAssembly binary, served from this app (see its README) |
-| `_headers`, `vercel.json` | **Step 3.** A Content-Security-Policy header for the AI worker only (Netlify / Vercel) |
+| `js/sync.js` | **Step 4.** What syncs and when: the queue, the merge rules, the status. No network, no DOM |
+| `js/sync-worker.js` | **Step 4.** The only file that talks to Supabase. Holds the session, never the key |
+| `js/sync-config.js` | **Step 4.** Your project URL and anon key. Empty means sync is off |
+| `supabase/schema.sql` | **Step 4.** The table, its Row Level Security policies and indexes. Paste into the SQL editor |
+| `vendor/supabase/` | **Step 4.** The Supabase client, served from this app rather than a CDN |
+| `_headers`, `vercel.json` | A Content-Security-Policy header for each Worker (Netlify / Vercel) |
 | `js/backup.js` | CSV builder and file download helper |
 | `tests/logic.test.mjs` | Step 1 logic tests (money, categories, totals, storage, backups) |
 | `tests/crypto.test.mjs` | Step 2 tests: what reaches disk, KDF parameters, lock/unlock, re-keying, restore |
 | `tests/insights.test.mjs` | Step 3 tests: the facts, the prompt, the number guard, the bridge, the charts |
+| `tests/sync.test.mjs` | Step 4 tests: the queue, conflicts, two devices, offline, keys |
+| `tests/sql.test.mjs` | Step 4: the SQL and its policies, against real PostgreSQL (optional dependency) |
 
 `money.js` and `backup.js` are small pure modules added beside the planned structure so `app.js` stays UI-only and the logic is testable in Node.
 
@@ -279,6 +286,100 @@ Three layers enforce this, so no single one is trusted alone:
 - Summaries are held in memory only. They are never written to storage, encrypted or not.
 - With Privacy Mode on, the summary is hidden and can't be requested.
 
+## Sync (optional)
+
+Off unless you set it up, and the app is complete without it. **With no project configured, the
+Supabase client is never fetched, no worker is started, and no request is made** — verified in a
+real browser, below.
+
+### Setting it up
+
+1. Create a project at [supabase.com](https://supabase.com).
+2. Paste [`supabase/schema.sql`](supabase/schema.sql) into the project's SQL editor and run it.
+3. Put the project URL and the **anon** key in [`js/sync-config.js`](js/sync-config.js).
+
+The anon key is meant to be public: it names the project and grants nothing on its own, because
+every row sits behind Row Level Security tied to the signed-in user. The **`service_role` key
+bypasses RLS entirely and must never appear in the frontend, this repo, or anywhere a browser can
+reach.** Sync needs a passphrase first (Step 2): the passphrase is what encrypts each item.
+
+### Two secrets, and only one of them can be reset
+
+| | What it does | Who has it |
+| --- | --- | --- |
+| **Account password** | Signs you in to Supabase | The server (hashed). Resettable by email |
+| **Passphrase** | Encrypts every item before it leaves the device | You, only. **Nobody can reset it** |
+
+The server holds sealed rows and has never seen the passphrase, so neither secret alone opens the
+ledger — and an attacker with the whole database has ciphertext and nothing else. The sign-in
+dialog says this in as many words, because people reasonably assume one password unlocks everything.
+
+### What the table holds
+
+```
+id  user_id  kind  iv  ciphertext  salt  updated_at  deleted  synced_at
+```
+
+`kind` is `transaction`, `schema` (the category tree), `settings` (currency only), or `keyinfo`.
+The `keyinfo` row carries the key's **salt** and a sealed check value, which is how a *new* device
+derives the same key from the passphrase. A salt is not a secret; it exists so one person's key is
+unique, and it is useless without the passphrase.
+
+**What the server still learns, unavoidably:** how many items you have, roughly how large each one
+is, and when you last changed each one. Not what any of them say.
+
+Two deliberate differences from a plain reading of the brief, both explained in the SQL:
+
+- **`primary key (user_id, id)`**, not `id` alone. Two people who imported the same backup file both
+  own an item with that uuid; a global key would let whoever synced first lock the other out with a
+  confusing error.
+- **A server-set `synced_at` column**, which is what devices page through. `updated_at` is the
+  device's clock and decides conflicts, but paging by it means a device whose clock is a few minutes
+  slow writes rows every other device scrolls straight past and never sees. There is a test for
+  exactly that.
+
+### How syncing works
+
+- **Every change queues its own item**, inside the encrypted document. That *is* the offline queue:
+  it survives a reload, a lock and a closed laptop, and it does not depend on any clock.
+- **A cycle pushes the queue, then pulls everything the server has seen since last time.**
+- **Conflicts resolve per item: newest `updatedAt` wins.** The timestamp used comes from *inside*
+  the ciphertext, not the plaintext column, because the sealed copy is the one AES-GCM guarantees
+  nobody edited. A local item that loses is replaced; one that wins stays queued and goes up next.
+- **Soft deletes sync like any other change**, so a deletion — and undoing it — reaches every device.
+- **It runs on unlock, a few seconds after each save, on *Sync now*, and when a connection returns.**
+  Status: *Synced · Syncing · Waiting to sync · Offline · Error*.
+- **Only the ledger syncs.** Theme, auto-lock, privacy mode and the dismissed banners stay on the
+  device that set them.
+
+**Sign out** keeps everything on the device and leaves the server copy alone. **Delete cloud data**
+removes every row for that account, keeps the device's ledger, and re-queues it in case you stay
+signed in.
+
+### A new device
+
+Sign in, then enter the account's passphrase. The device derives the same key from the `keyinfo`
+salt, re-seals its own ledger under it, and pulls everything down. **The sign-in is only recorded
+once that key is proven** — a wrong passphrase leaves the device signed out rather than half-joined,
+which matters because a half-joined device would otherwise upload items sealed with a key the
+account cannot read.
+
+Changing the passphrase re-keys the vault *and* re-queues every item, because everything already on
+the server was sealed with the old key.
+
+### Where the network lives
+
+The page keeps `connect-src 'none'` — **it still cannot open a connection to anything.** All network
+access is in `js/sync-worker.js`, which gets its own Content-Security-Policy response header naming
+Supabase and nothing else (`_headers`, `vercel.json`), plus a guard inside the worker itself. The
+Supabase client is **vendored** in `vendor/supabase/`, so no CDN is involved; the brief suggested a
+CDN, and switching back is one `importScripts` line plus a host in the header.
+
+The session tokens live **inside the encrypted vault**, not in `localStorage` where the Supabase
+client would normally put them. So they are only available while the ledger is unlocked, a lock
+takes the worker down with them, and a backup file never contains one.
+
+## Privacy
 ## Privacy
 
 `index.html` ships a Content-Security-Policy with `connect-src 'none'`, so the **browser itself** blocks any fetch, XHR, WebSocket or beacon from the page. The only script origin allowed besides this site is the Tailwind CDN. Step 3's model download does not widen that policy: it runs in a Worker, which a `<meta>` policy can't reach, so the worker gets its own response header (see [On-device AI](#on-device-ai)). Step 4 (Supabase) will need to widen `connect-src` on purpose. If you edit either inline `<script>` in `index.html`, update its `sha256-…` in the policy. `frame-ancestors` can't be set from a `<meta>`; add it as a response header on your host.
@@ -306,7 +407,7 @@ Merge (by UUID, newer edit wins) or Replace.
 node --test tests/*.test.mjs
 ```
 
-128 tests, no dependencies. The Step 2 file checks the security properties themselves, not just
+157 tests, no dependencies. The Step 2 file checks the security properties themselves, not just
 that the code runs: that nothing readable reaches storage, that the key is non-extractable, that
 the parameters actually used are the advertised ones (it re-derives the key independently and
 opens the vault with it), and that no failure path can lose data.

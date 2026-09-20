@@ -1,11 +1,19 @@
-# Netlify. Applies a Content-Security-Policy to the AI worker only.
+# Netlify. Each Worker gets its own Content-Security-Policy, naming the only hosts it may reach.
 #
-# The page's own policy is a <meta> tag (index.html). A meta policy does NOT reach a Worker that
-# is loaded from a URL, so without this the worker's network access would be limited only by the
-# guard inside ai-worker.js. This header makes the BROWSER enforce the same rule: the worker may
-# talk to this site and to the Hugging Face model host, and nothing else.
+# The PAGE's policy is a <meta> tag in index.html and stays `connect-src 'none'`: the page itself
+# cannot open a connection to anywhere, and never has. A <meta> policy does NOT reach a Worker
+# loaded from a URL, so without these headers a worker's network access would be limited only by
+# the guard inside its own source. These make the BROWSER enforce it.
 #
-# 'wasm-unsafe-eval' is required to run WebAssembly. Keep the hosts in step with MODEL_HOSTS in
-# js/ai-worker.js. (Vercel reads vercel.json instead; the two must say the same thing.)
+# 'wasm-unsafe-eval' is required to run WebAssembly.
+
+# Step 3: the on-device AI. May fetch the model, and nothing else.
+# Keep in step with MODEL_HOSTS in js/ai-worker.js.
 /js/ai-worker.js
   Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' https://huggingface.co https://*.hf.co; base-uri 'none'
+
+# Step 4: sync. May reach Supabase, and nothing else. The Supabase client itself is served from
+# this site (vendor/supabase/), so no CDN is named here.
+# If you self-host Supabase, replace the wildcard with your own origin.
+/js/sync-worker.js
+  Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self' https://*.supabase.co https://*.supabase.in; base-uri 'none'

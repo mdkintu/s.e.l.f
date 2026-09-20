@@ -9,6 +9,7 @@ import { passphraseStrength, MIN_PASSPHRASE } from './crypto.js';
 import * as insights from './insights.js';
 import { donutChart, barChart, niceScale } from './charts.js';
 import { buildCsv, download, stamp } from './backup.js';
+import { createSync } from './sync.js';
 
 /* ================================================================== */
 /* Small helpers                                                       */
@@ -1148,6 +1149,8 @@ function settingsHtml() {
 
       ${securityHtml(settings)}
 
+      ${syncCardHtml()}
+
       <section class="card" aria-labelledby="s-cats">
         <h3 id="s-cats" class="card-title">Categories</h3>
         <p class="mb-3 text-sm muted">Switch a category off to hide it from the entry form. Past transactions keep their label. Built-in categories can be hidden but not deleted.</p>
@@ -1369,6 +1372,10 @@ function wireSettings() {
         }
         break;
       case 'encrypt': showLock('setup'); break;
+      case 'sync-open': await syncSetupFlow(); break;
+      case 'sync-now': await guardAsync(() => sync.syncNow()); break;
+      case 'sync-signout': await syncSignOutFlow(); break;
+      case 'sync-delete': await syncDeleteFlow(); break;
       case 'lock-now': await lockNow(); break;
       case 'change-passphrase': await changePassphraseFlow(); break;
       case 'export-self': await exportEncrypted(); break;
@@ -1927,6 +1934,7 @@ function teardownLedger() {
   entryForm = null;
   hideToast();
   releaseAiForLock();
+  sync.stop(); // the worker holds the session, so locking takes it down too
   for (const id of ['#entry', '#view-month', '#view-insights', '#view-settings', '#banner']) $(id).replaceChildren();
   for (const dlg of document.querySelectorAll('dialog[open]')) dlg.close('');
 }
@@ -1937,6 +1945,7 @@ function mountLedger() {
   showTab(ui.tab, { focus: false });
   renderChrome();
   startAutoLock();
+  sync.start(); // picks up anything queued from last time, once the ledger is open
 }
 
 /** Everything that may open a dialog, once the lock screen is out of the way. */
@@ -1955,6 +1964,212 @@ async function openLedger() {
   hideLock();
   mountLedger();
   await finishOpen();
+}
+
+/* ================================================================== */
+/* Sync: an optional account, and the same ledger on another device    */
+/* ================================================================== */
+
+// Like the AI, sync is off until asked for, and constructing this starts nothing: no worker, no
+// Supabase library, no request. A guest never touches it.
+const sync = createSync({ store });
+
+const SYNC_PITCH = 'Access your ledger on any device. Backups are encrypted before they leave this device.';
+
+const STATUS = {
+  syncing: { label: 'Syncing…', tone: 'text-slate-600 dark:text-slate-400' },
+  idle: { label: 'Synced', tone: 'text-emerald-800 dark:text-emerald-300' },
+  pending: { label: 'Waiting to sync', tone: 'text-slate-600 dark:text-slate-400' },
+  offline: { label: 'Offline', tone: 'text-amber-800 dark:text-amber-300' },
+  error: { label: 'Error', tone: 'text-rose-800 dark:text-rose-300' },
+  'signed-out': { label: 'Not signed in', tone: 'muted' },
+  unconfigured: { label: 'Not set up', tone: 'muted' },
+};
+
+/** Re-render whatever shows sync status, without disturbing anything else. */
+function onSyncState() {
+  if (store.isLocked()) return;
+  if (ui.tab === 'settings') renderSettings();
+  renderChrome();
+}
+
+const syncAvailable = () => sync.isConfigured();
+const signedIn = () => !store.isLocked() && Boolean(store.getSyncState().userId);
+
+/** Sync needs the Step 2 key: there is nothing to encrypt an item with otherwise. */
+const syncNeedsPassphrase = () => !store.isEncrypted();
+
+function syncBannerHtml() {
+  if (!syncAvailable() || signedIn() || store.getSettings().syncBannerDismissed) return '';
+  return html`
+    <div class="mb-4 rounded-xl border border-teal-300 bg-teal-50 p-3 dark:border-teal-800 dark:bg-teal-950" role="status">
+      <p class="text-sm font-medium text-teal-950 dark:text-teal-100">${SYNC_PITCH}</p>
+      <div class="mt-2 flex flex-wrap gap-2">
+        <button type="button" class="btn-primary !min-h-11 !py-1" data-act="sync-open" data-key="sync-open">Set up sync</button>
+        <button type="button" class="btn-secondary !min-h-11 !py-1" data-act="sync-dismiss" data-key="sync-dismiss">Not now</button>
+      </div>
+    </div>`;
+}
+
+function syncCardHtml() {
+  const s = sync.getState();
+  const status = STATUS[s.phase] ?? STATUS.error;
+  const state = store.getSyncState();
+
+  if (!syncAvailable()) {
+    return html`
+      <section class="card space-y-2" aria-labelledby="s-sync">
+        <h3 id="s-sync" class="card-title">Sync</h3>
+        <p class="text-sm muted">This copy of the app has no Supabase project set up, so there is nothing to sync to. Everything stays on this device.</p>
+        <p class="text-sm muted">To turn it on: create a project, run <code>supabase/schema.sql</code> in its SQL editor, and put the project URL and anon key in <code>js/sync-config.js</code>.</p>
+      </section>`;
+  }
+
+  if (!signedIn()) {
+    return html`
+      <section class="card space-y-3" aria-labelledby="s-sync">
+        <h3 id="s-sync" class="card-title">Sync <span class="text-sm font-normal muted">(optional)</span></h3>
+        <p class="text-sm muted">${SYNC_PITCH} Your passphrase never leaves this device, so the server stores only sealed data it cannot read.</p>
+        ${syncNeedsPassphrase() ? html`
+          <p class="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100">
+            Sync needs a passphrase first: it is what encrypts each item before it goes up.
+          </p>
+          <button type="button" class="btn-primary" data-act="encrypt" data-key="sync-encrypt">${icon('shield', 20)}Set a passphrase</button>`
+    : html`<button type="button" class="btn-primary" data-act="sync-open" data-key="sync-open">Sign in or create an account</button>`}
+      </section>`;
+  }
+
+  return html`
+    <section class="card space-y-3" aria-labelledby="s-sync">
+      <h3 id="s-sync" class="card-title">Sync</h3>
+      <p class="text-sm"><strong>${state.email}</strong></p>
+      <p class="text-sm ${status.tone}" role="status" data-key="sync-status">
+        ${status.label}${s.queued ? ` · ${plural(s.queued, 'change')} waiting` : ''}${s.phase === 'idle' && s.lastSyncAt ? ` · ${fmtStamp.format(new Date(s.lastSyncAt))}` : ''}
+      </p>
+      ${s.message ? html`<p class="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100">${s.message}</p>` : ''}
+      <div class="flex flex-wrap gap-2">
+        <button type="button" class="btn-secondary" data-act="sync-now" data-key="sync-now" ${s.phase === 'syncing' ? 'disabled' : ''}>Sync now</button>
+        <button type="button" class="btn-secondary" data-act="sync-signout" data-key="sync-signout">Sign out</button>
+        <button type="button" class="btn-danger" data-act="sync-delete" data-key="sync-delete">Delete cloud data</button>
+      </div>
+      <p class="text-xs muted">Signing out leaves everything on this device. The server only ever holds sealed items; it has never had your passphrase.</p>
+    </section>`;
+}
+
+/* ---------- the flows ---------- */
+
+/** Email + password, for signing in or creating an account. */
+async function accountDialog() {
+  let mode = 'in';
+  const liveCount = store.getTransactions().filter((t) => !t.deleted).length;
+  const { dlg, done } = mountDialog(html`
+    <form class="space-y-4 p-5" novalidate>
+      <h2 id="dlg-title" class="text-lg font-semibold">Sync across devices</h2>
+      <div class="seg-wrap" role="radiogroup" aria-label="Account">
+        ${[['in', 'I have an account'], ['up', 'Create an account']].map(([v, label]) => html`
+          <label class="seg"><input type="radio" class="sr-only" name="acct-mode" value="${v}" ${v === mode ? 'checked' : ''}><span class="seg-face">${label}</span></label>`)}
+      </div>
+      <p class="rounded-xl border border-slate-300 bg-white p-3 text-sm dark:border-slate-700 dark:bg-slate-900">
+        <strong>This password is not your passphrase.</strong> The password signs you in to the server. The passphrase
+        encrypts your ledger and never leaves this device. The server cannot read your ledger with either of them alone,
+        and nobody can reset the passphrase for you.
+      </p>
+      ${liveCount ? html`<p id="acct-upload" class="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100">
+        The ${plural(liveCount, 'transaction')} already on this device will be uploaded to whichever account you sign in to.
+        If this ledger is not yours, sign in to your own account rather than creating a new one here.
+      </p>` : ''}
+      <div>
+        <label class="field-label" for="acct-email">Email</label>
+        <input id="acct-email" type="email" class="input" autocomplete="email" autocapitalize="off" spellcheck="false" required>
+      </div>
+      ${passphraseField({ id: 'acct-pass', label: 'Account password', autocomplete: 'current-password' })}
+      <p id="acct-error" role="alert" class="min-h-5 text-sm font-medium text-rose-700 dark:text-rose-300"></p>
+      <div class="flex flex-wrap justify-end gap-2">
+        <button type="button" class="btn-secondary" data-close="">Cancel</button>
+        <button type="submit" class="btn-primary" id="acct-go">Sign in</button>
+      </div>
+    </form>`);
+  wirePeek(dlg);
+
+  const go = $('#acct-go', dlg);
+  dlg.addEventListener('change', (e) => {
+    if (e.target.name !== 'acct-mode') return;
+    mode = e.target.value;
+    go.textContent = mode === 'in' ? 'Sign in' : 'Create account';
+    $('#acct-pass', dlg).setAttribute('autocomplete', mode === 'in' ? 'current-password' : 'new-password');
+  });
+
+  let outcome = null;
+  $('form', dlg).addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fail = (m) => { $('#acct-error', dlg).textContent = m; };
+    fail('');
+    const email = $('#acct-email', dlg).value.trim();
+    const password = $('#acct-pass', dlg).value;
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return fail('Enter a valid email address.');
+    if (password.length < 8) return fail('Use a password of at least 8 characters.');
+    try {
+      outcome = await busy(go, mode === 'in' ? 'Signing in…' : 'Creating…', () => (mode === 'in' ? sync.signIn(email, password) : sync.signUp(email, password)));
+    } catch (err) {
+      return fail(err.message);
+    }
+    dlg.close('done');
+    return undefined;
+  });
+
+  await done;
+  return outcome;
+}
+
+async function syncSetupFlow() {
+  if (syncNeedsPassphrase()) { showLock('setup'); return; }
+  const result = await guardAsync(() => accountDialog());
+  if (!result) { onSyncState(); return; }
+
+  if (result.needsConfirmation) {
+    await alertDialog('Check your email', 'The account is created. Open the confirmation link we sent, then come back and sign in.');
+    return;
+  }
+  if (result.needsPassphrase) {
+    // This account's items were sealed with a different passphrase than this device uses. Until
+    // that passphrase is given, the sign-in is not recorded and nothing syncs either way.
+    let joined = null;
+    while (!joined) {
+      const passphrase = await askPassphrase({
+        title: 'Enter this account\'s passphrase',
+        message: 'This account\'s ledger was encrypted with a passphrase that does not match this device\'s. Enter the account\'s passphrase to join it. Everything already on this device will be re-encrypted with it and uploaded.',
+        confirmLabel: 'Join and sync',
+      });
+      if (passphrase === null) { await guardAsync(() => sync.signOut()); onSyncState(); return; }
+      joined = await guardAsync(() => sync.adoptKey(passphrase, result.keyInfo));
+    }
+  }
+  toast('Sync is on. Your ledger is sealed before it leaves this device.');
+  onSyncState();
+}
+
+async function syncSignOutFlow() {
+  const go = await confirmDialog({
+    title: 'Sign out of sync?',
+    message: 'Everything stays on this device, and the copy on the server is left alone. You can sign back in whenever you like.',
+    confirmLabel: 'Sign out',
+  });
+  if (!go) return;
+  await guardAsync(() => sync.signOut());
+  toast('Signed out. Your ledger is still here.');
+  onSyncState();
+}
+
+async function syncDeleteFlow() {
+  const go = await confirmDialog({
+    title: 'Delete the copy on the server?',
+    message: 'Every item this account has on the server is removed for good. Your ledger stays on this device, untouched. If you stay signed in, it will be uploaded again on the next sync.',
+    confirmLabel: 'Delete cloud data',
+    danger: true,
+  });
+  if (!go) return;
+  if (await guardAsync(() => sync.deleteCloudData())) toast('The server copy has been deleted.');
+  onSyncState();
 }
 
 /* ================================================================== */
@@ -1980,7 +2195,9 @@ function renderChrome() {
   if (bootInfo.recovered && !store.isEncrypted()) notes.push(`The saved data couldn't be read (${bootInfo.recovered}). It was set aside in this browser under "self.data.corrupt" and the app started fresh.`);
   // Encrypted saves happen after the change is on screen, so a failure has to be reported here.
   if (store.getWriteError()) notes.push(`${store.getWriteError()} Your last change is on screen but not saved.`);
-  put($('#banner'), html`${notes.map((n) => html`<p class="mb-4 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100" role="status">${n}</p>`)}`);
+  put($('#banner'), html`
+    ${notes.map((n) => html`<p class="mb-4 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100" role="status">${n}</p>`)}
+    ${syncBannerHtml()}`);
 }
 
 /**
@@ -2001,6 +2218,7 @@ function renderAll() {
   if (lockKind === 'setup') refreshSetupCount();
   renderChrome();
   startAutoLock(); // any change counts as activity, and may have changed the timeout itself
+  sync.schedule(); // debounced, and a no-op when there is nothing queued
   entryForm?.refresh();
   // Views that are not on screen are emptied rather than left stale: showTab() redraws them on demand,
   // and it keeps amounts from lingering in hidden DOM after Privacy Mode is switched on.
@@ -2028,6 +2246,12 @@ function showTab(tab, { focus = true } = {}) {
 
 function wireShell() {
   for (const el of document.querySelectorAll('[data-icon]')) el.innerHTML = icon(el.dataset.icon).s;
+  $('#banner').addEventListener('click', async (e) => {
+    const act = e.target.closest('[data-act]')?.dataset.act;
+    if (act === 'sync-open') await syncSetupFlow();
+    else if (act === 'sync-dismiss') guard(() => store.updateSettings({ syncBannerDismissed: true }));
+  });
+  sync.subscribe(onSyncState);
   for (const btn of document.querySelectorAll('[data-tab]')) btn.addEventListener('click', () => showTab(btn.dataset.tab));
   $('#privacy-btn').addEventListener('click', () => guard(() => store.updateSettings({ privacyMode: !privacyOn() })));
   darkQuery.addEventListener('change', applyTheme);

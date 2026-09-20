@@ -275,8 +275,9 @@ test('persistence: data survives a reload; nothing is written until the first ch
   assert.equal(localStorage.getItem('self.data'), null);
   add('Food', 'Groceries', 5000);
   const saved = JSON.parse(localStorage.getItem('self.data'));
-  assert.equal(saved.schemaVersion, 1);
-  assert.deepEqual(Object.keys(saved).sort(), ['categories', 'schemaVersion', 'settings', 'transactions']);
+  assert.equal(saved.schemaVersion, store.SCHEMA_VERSION);
+  assert.deepEqual(Object.keys(saved).sort(),
+    ['categories', 'schemaUpdatedAt', 'schemaVersion', 'settings', 'settingsUpdatedAt', 'sync', 'transactions']);
   store.init();
   assert.equal(store.getTransactions().length, 1);
 });
@@ -382,6 +383,11 @@ test('export → clear storage → import restores everything exactly', () => {
   assert.deepEqual(after.settings, { ...before.settings, currencyConfirmed: true });
   assert.deepEqual(after.categories, before.categories);
   assert.deepEqual(after.transactions, before.transactions);
+  assert.equal(after.schemaUpdatedAt, before.schemaUpdatedAt, 'the tree keeps its edit time');
+  // copied before sorting: getState() hands back the live document, and sorting it in place
+  // would quietly reorder what the next assertion re-reads from storage
+  assert.deepEqual([...after.sync.dirty].sort(), [...before.transactions.map((t) => t.id), 'schema', 'settings'].sort(),
+    'and the restored ledger is queued for upload');
   store.init(); // and it persisted
   assert.deepEqual(store.getState(), after);
 });
@@ -450,7 +456,7 @@ test('import validation: bad files are refused, bad records are skipped and coun
   assert.throws(() => store.parseBackup('[]'), /does not look like/);
   assert.throws(() => store.parseBackup('{"transactions":{}}'), /does not look like/);
   assert.throws(() => store.parseBackup('{"app":"Other","transactions":[]}'), /different app/);
-  assert.throws(() => store.parseBackup(JSON.stringify({ schemaVersion: 2, transactions: [] })), /newer version/);
+  assert.throws(() => store.parseBackup(JSON.stringify({ schemaVersion: store.SCHEMA_VERSION + 1, transactions: [] })), /newer version/);
   assert.throws(() => store.parseBackup(JSON.stringify({ transactions: [], categories: [{ id: 'x', type: 'bad' }] })), /damaged/);
 
   const good = add('Food', 'Groceries', 1000);
