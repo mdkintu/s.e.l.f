@@ -95,6 +95,10 @@
     .save-bar.in-dialog { bottom: 0; padding-bottom: 0; }
     .save-error:not(:empty) { margin-bottom: .5rem; }
 
+    /* Lock screen: covers everything, including the fixed bottom nav */
+    #lock { position: fixed; inset: 0; z-index: 30; overflow-y: auto; background: var(--page-bg);
+      padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+
     @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
   </style>
   <style type="text/tailwindcss">
@@ -117,7 +121,7 @@
 <body class="min-h-dvh bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100">
   <a class="skip" href="#main">Skip to content</a>
 
-  <div class="mx-auto w-full max-w-2xl px-4 pb-32" style="padding-top: max(1rem, env(safe-area-inset-top))">
+  <div id="app-shell" class="mx-auto w-full max-w-2xl px-4 pb-32" style="padding-top: max(1rem, env(safe-area-inset-top))">
     <header class="mb-4 flex items-center justify-between">
       <h1 class="text-xl font-bold tracking-tight">S.E.L.F</h1>
       <button id="privacy-btn" type="button" class="btn-secondary !px-3" aria-pressed="false"
@@ -135,7 +139,10 @@
     </main>
   </div>
 
-  <nav aria-label="Main" class="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 backdrop-blur dark:border-slate-800 dark:bg-slate-900/95"
+  <!-- The lock screen replaces the whole app: while it is up, nothing decrypted exists in the DOM. -->
+  <div id="lock" hidden></div>
+
+  <nav id="app-nav" aria-label="Main" class="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 backdrop-blur dark:border-slate-800 dark:bg-slate-900/95"
        style="padding-bottom: env(safe-area-inset-bottom)">
     <div class="mx-auto grid max-w-2xl grid-cols-3">
       <button type="button" class="tab" data-tab="add"><span data-icon="plus" aria-hidden="true"></span>Add</button>
@@ -147,7 +154,7 @@
   <div id="toast" role="status" aria-live="polite" class="pointer-events-none fixed inset-x-0 z-50 flex justify-center px-4"
        style="bottom: calc(5rem + env(safe-area-inset-bottom))"></div>
 
-  <input id="import-file" type="file" accept=".json,application/json" hidden>
+  <input id="import-file" type="file" accept=".json,.self,application/json,application/octet-stream" hidden>
 
   <noscript>
     <p class="mx-auto max-w-md p-6 text-center">S.E.L.F needs JavaScript to run. It never sends your data anywhere.</p>

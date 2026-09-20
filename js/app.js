@@ -5,6 +5,7 @@
 import * as store from './store.js';
 import * as schema from './schema.js';
 import * as money from './money.js';
+import { passphraseStrength, MIN_PASSPHRASE } from './crypto.js';
 import { buildCsv, download, stamp } from './backup.js';
 
 /* ================================================================== */
@@ -34,6 +35,8 @@ const ICONS = {
   cog: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
   pencil: '<path d="M4 20h4L19 9l-4-4L4 16v4z"/><path d="M13.5 6.5l4 4"/>',
   trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
+  lock: '<rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
+  shield: '<path d="M12 3l7 3v6c0 4.6-3 8.3-7 9-4-.7-7-4.4-7-9V6l7-3z"/>',
   up: '<path d="M6 15l6-6 6 6"/>',
   down: '<path d="M6 9l6 6 6-6"/>',
   left: '<path d="M15 6l-6 6 6 6"/>',
@@ -757,6 +760,8 @@ function settingsHtml() {
         </fieldset>
       </section>
 
+      ${securityHtml(settings)}
+
       <section class="card" aria-labelledby="s-cats">
         <h3 id="s-cats" class="card-title">Categories</h3>
         <p class="mb-3 text-sm muted">Switch a category off to hide it from the entry form. Past transactions keep their label. Built-in categories can be hidden but not deleted.</p>
@@ -775,13 +780,47 @@ function settingsHtml() {
         <h3 id="s-backup" class="card-title">Backup</h3>
         <p class="mb-3 text-sm muted">Your data lives only in this browser. Export a backup now and then, especially before clearing browser data or switching devices.</p>
         <div class="flex flex-wrap gap-2">
-          <button type="button" class="btn-secondary" data-act="export-json" data-key="export-json">Export JSON (full backup)</button>
-          <button type="button" class="btn-secondary" data-act="export-csv" data-key="export-csv">Export CSV</button>
-          <button type="button" class="btn-secondary" data-act="import" data-key="import">Import JSON…</button>
+          ${store.isEncrypted() ? html`<button type="button" class="btn-primary" data-act="export-self" data-key="export-self">Export encrypted backup (.self)</button>` : ''}
+          <button type="button" class="btn-secondary" data-act="export-json" data-key="export-json">Export JSON (unencrypted)</button>
+          <button type="button" class="btn-secondary" data-act="export-csv" data-key="export-csv">Export CSV (unencrypted)</button>
+          <button type="button" class="btn-secondary" data-act="import" data-key="import">Import a backup…</button>
         </div>
+        ${store.isEncrypted() ? html`<p class="mt-3 text-sm muted">A <strong>.self</strong> file opens with this passphrase on any device. The JSON and CSV files are plain text that anyone can read — treat them like cash.</p>` : ''}
         <p class="mt-3 text-sm muted">${plural(live, 'transaction')} on this device · about ${kb} KB used of roughly 5 MB.</p>
       </section>
     </div>`;
+}
+
+const AUTO_LOCK_LABEL = (m) => (m === 0 ? 'Never (not recommended)' : plural(m, 'minute'));
+
+function securityHtml(settings) {
+  if (!store.isEncrypted()) {
+    return html`
+      <section class="card space-y-3" aria-labelledby="s-security">
+        <h3 id="s-security" class="card-title">Security</h3>
+        <p class="text-sm"><strong>This ledger is not encrypted.</strong> It is stored in this browser as plain text, so anyone who can open this browser profile can read it.</p>
+        ${store.isCryptoAvailable()
+    ? html`<button type="button" class="btn-primary" data-act="encrypt" data-key="encrypt"><span>${icon('shield', 20)}</span>Protect with a passphrase</button>`
+    : html`<p class="text-sm muted">Encryption needs a secure connection. Open S.E.L.F over https, or from localhost.</p>`}
+      </section>`;
+  }
+  return html`
+    <section class="card space-y-3" aria-labelledby="s-security">
+      <h3 id="s-security" class="card-title">Security</h3>
+      <p class="text-sm"><strong>Encrypted on this device.</strong> AES-GCM 256. The key is derived from your passphrase with PBKDF2-SHA256 at 600,000 iterations and is never written down anywhere.</p>
+      <div>
+        <label class="field-label" for="s-autolock">Lock automatically after</label>
+        <select id="s-autolock" class="input" data-setting="autolock" data-key="autolock">
+          ${store.AUTO_LOCK_CHOICES.map((m) => html`<option value="${m}" ${settings.autoLockMinutes === m ? 'selected' : ''}>${AUTO_LOCK_LABEL(m)}</option>`)}
+        </select>
+        <p class="mt-1 text-sm muted">Also locks when this tab has been in the background that long.</p>
+      </div>
+      <div class="flex flex-wrap gap-2">
+        <button type="button" class="btn-secondary" data-act="lock-now" data-key="lock-now">${icon('lock', 20)}Lock now</button>
+        <button type="button" class="btn-secondary" data-act="change-passphrase" data-key="change-passphrase">Change passphrase</button>
+      </div>
+      <p class="text-sm muted">${FORGOTTEN}</p>
+    </section>`;
 }
 
 function renderSettings() {
@@ -889,6 +928,7 @@ function wireSettings() {
   root.addEventListener('change', (e) => {
     const setting = e.target.dataset.setting;
     if (setting === 'theme') guard(() => store.updateSettings({ theme: e.target.value }));
+    else if (setting === 'autolock') guard(() => store.updateSettings({ autoLockMinutes: Number(e.target.value) }));
     else if (setting === 'cat-type') { ui.settingsType = e.target.value; renderSettings(); }
   });
 
@@ -942,6 +982,10 @@ function wireSettings() {
           toast('Categories reset to defaults');
         }
         break;
+      case 'encrypt': showLock('setup'); break;
+      case 'lock-now': await lockNow(); break;
+      case 'change-passphrase': await changePassphraseFlow(); break;
+      case 'export-self': await exportEncrypted(); break;
       case 'export-json': exportJson(); break;
       case 'export-csv': exportCsv(); break;
       case 'import': $('#import-file').click(); break;
@@ -954,8 +998,92 @@ function wireSettings() {
 /* Backup                                                              */
 /* ================================================================== */
 
+/** Like guard(), for the asynchronous crypto paths. */
+async function guardAsync(fn) {
+  try { return await fn(); } catch (err) {
+    if (!isFriendly(err)) throw err;
+    toast(err.message);
+    return undefined;
+  }
+}
+
 function exportJson() {
   download(`self-backup-${stamp()}.json`, JSON.stringify(store.exportBackup(), null, 2), 'application/json');
+}
+
+/** The sealed .self backup: the same document, encrypted with this device's key. */
+async function exportEncrypted() {
+  const text = await guardAsync(() => store.exportEncryptedBackup());
+  if (text) {
+    download(`self-backup-${stamp()}.self`, text, 'application/octet-stream');
+    toast('Encrypted backup saved. It opens with your passphrase.');
+  }
+}
+
+/** Ask for a passphrase in a dialog. → the passphrase, or null if cancelled. */
+async function askPassphrase({ title, message, confirmLabel = 'Continue' }) {
+  let entered = null;
+  const { dlg, done } = mountDialog(html`
+    <form class="space-y-4 p-5" novalidate>
+      <h2 id="dlg-title" class="text-lg font-semibold">${title}</h2>
+      <p class="muted">${message}</p>
+      ${passphraseField({ id: 'ask-pass', label: 'Passphrase', autocomplete: 'current-password' })}
+      <div class="flex flex-wrap justify-end gap-2">
+        <button type="button" class="btn-secondary" data-close="">Cancel</button>
+        <button type="submit" class="btn-primary">${confirmLabel}</button>
+      </div>
+    </form>`);
+  wirePeek(dlg);
+  $('form', dlg).addEventListener('submit', (e) => {
+    e.preventDefault();
+    entered = $('#ask-pass', dlg).value;
+    dlg.close('ok');
+  });
+  $('#ask-pass', dlg).focus();
+  return (await done) === 'ok' ? entered : null;
+}
+
+async function changePassphraseFlow() {
+  const { dlg, done } = mountDialog(html`
+    <form class="space-y-4 p-5" novalidate>
+      <h2 id="dlg-title" class="text-lg font-semibold">Change passphrase</h2>
+      <p class="muted">Everything is re-encrypted with a brand new key. Backup files you already exported still open with the old passphrase.</p>
+      ${passphraseField({ id: 'cp-old', label: 'Current passphrase', autocomplete: 'current-password' })}
+      ${passphraseField({ id: 'cp-new', label: 'New passphrase', autocomplete: 'new-password', describedBy: 'cp-meter' })}
+      <p id="cp-meter" class="min-h-10 text-sm muted" aria-live="polite"></p>
+      ${passphraseField({ id: 'cp-confirm', label: 'Confirm new passphrase', autocomplete: 'new-password' })}
+      <p id="cp-error" role="alert" class="min-h-5 text-sm font-medium text-rose-700 dark:text-rose-300"></p>
+      <div class="flex flex-wrap justify-end gap-2">
+        <button type="button" class="btn-secondary" data-close="">Cancel</button>
+        <button type="submit" class="btn-primary" id="cp-save">Change passphrase</button>
+      </div>
+    </form>`);
+  wirePeek(dlg);
+
+  const fail = (message, field) => { $('#cp-error', dlg).textContent = message; $(`#${field}`, dlg).focus(); };
+  $('#cp-new', dlg).addEventListener('input', (e) => {
+    const { score, label, bits, hint } = passphraseStrength(e.target.value);
+    $('#cp-meter', dlg).textContent = e.target.value ? (score === 0 ? `${label} — ${hint}` : `${label} (roughly ${bits} bits) — ${hint}`) : '';
+  });
+
+  $('form', dlg).addEventListener('submit', async (e) => {
+    e.preventDefault();
+    $('#cp-error', dlg).textContent = '';
+    const next = $('#cp-new', dlg).value;
+    if (next.length < MIN_PASSPHRASE) return fail(`Use a passphrase of at least ${MIN_PASSPHRASE} characters.`, 'cp-new');
+    if (next !== $('#cp-confirm', dlg).value) return fail('The new passphrases do not match.', 'cp-confirm');
+    try {
+      await busy($('#cp-save', dlg), 'Re-encrypting…', () => store.changePassphrase($('#cp-old', dlg).value, next));
+    } catch (err) {
+      if (!isFriendly(err)) throw err;
+      return fail(err.message, 'cp-old');
+    }
+    dlg.close('done');
+    toast('Passphrase changed. Export a fresh backup.');
+    return undefined;
+  });
+
+  await done;
 }
 
 function exportCsv() {
@@ -965,12 +1093,37 @@ function exportCsv() {
 
 const MAX_IMPORT_BYTES = 25 * 1024 * 1024;
 
+/**
+ * Read a backup file, asking for its passphrase if it is a sealed .self.
+ * → a parsed backup, or null if the person gave up. A wrong passphrase can be retried.
+ */
+async function readBackupFile(file) {
+  if (file.size > MAX_IMPORT_BYTES) throw new store.StoreError('That file is too large to be a S.E.L.F backup.');
+  const text = await file.text();
+  if (!store.looksEncrypted(text)) return store.parseBackup(text);
+
+  for (;;) {
+    const passphrase = await askPassphrase({
+      title: 'This backup is encrypted',
+      message: `Enter the passphrase that ${file.name} was exported with. It does not have to match this device's passphrase.`,
+      confirmLabel: 'Open backup',
+    });
+    if (passphrase === null) return null;
+    try {
+      return await store.parseEncryptedBackup(text, passphrase);
+    } catch (err) {
+      if (!isFriendly(err)) throw err;
+      await alertDialog('Couldn\'t open that backup', err.message);
+    }
+  }
+}
+
 async function importFile(file) {
   let parsed;
   let report;
   try {
-    if (file.size > MAX_IMPORT_BYTES) throw new store.StoreError('That file is too large to be a S.E.L.F backup.');
-    parsed = store.parseBackup(await file.text());
+    parsed = await readBackupFile(file);
+    if (!parsed) return;
     report = store.previewImport(parsed);
   } catch (err) {
     if (!isFriendly(err)) throw err;
@@ -1029,6 +1182,395 @@ function wireImport() {
 }
 
 /* ================================================================== */
+/* Lock screen: unlock, first-run setup, auto-lock                     */
+/* ================================================================== */
+
+const FORGOTTEN = 'If you forget this passphrase, your data cannot be recovered. Nobody can reset it — not us, not your browser. Keep an exported backup.';
+
+let lockKind = null;     // 'unlock' | 'setup' | 'damaged' | null when the ledger is open
+let countdownTimer = 0;
+
+const lockEl = () => $('#lock');
+
+/** Let the show/hide button work inside any container (the lock screen, or a dialog). */
+function wirePeek(root) {
+  root.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-act="peek"]');
+    if (!btn) return;
+    const field = $(`#${btn.dataset.target}`, root);
+    const show = field.type === 'password';
+    field.type = show ? 'text' : 'password';
+    btn.setAttribute('aria-pressed', String(show));
+    btn.setAttribute('aria-label', show ? 'Hide passphrase' : 'Show passphrase');
+    put(btn, icon(show ? 'eyeOff' : 'eye'));
+    field.focus();
+  });
+}
+
+/** A passphrase box with a show/hide button. Never rendered with a value in the markup. */
+const passphraseField = ({ id, label, autocomplete, describedBy = '' }) => html`
+  <div>
+    <label class="field-label" for="${id}">${label}</label>
+    <div class="flex gap-2">
+      <input id="${id}" type="password" class="input" autocomplete="${autocomplete}" autocapitalize="off"
+             autocorrect="off" spellcheck="false" ${describedBy ? html`aria-describedby="${describedBy}"` : ''}>
+      <button type="button" class="btn-secondary !px-3" data-act="peek" data-target="${id}"
+              aria-pressed="false" aria-label="Show passphrase">${icon('eye')}</button>
+    </div>
+  </div>`;
+
+const lockFrame = (title, subtitle, body) => html`
+  <div class="mx-auto flex min-h-dvh w-full max-w-md flex-col justify-center gap-5 px-4 py-8">
+    <div class="text-center">
+      <span class="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-2xl bg-teal-700 text-white dark:bg-teal-400 dark:text-slate-950" aria-hidden="true">${icon('lock', 28)}</span>
+      <h1 id="lock-title" tabindex="-1" class="text-xl font-bold tracking-tight">${title}</h1>
+      <p class="mt-1 text-sm muted">${subtitle}</p>
+    </div>
+    ${body}
+  </div>`;
+
+function unlockHtml(message) {
+  return lockFrame('S.E.L.F is locked', 'Enter your passphrase to open your ledger.', html`
+    <form class="space-y-4" novalidate>
+      ${message ? html`<p class="rounded-xl border border-slate-300 bg-white p-3 text-sm dark:border-slate-700 dark:bg-slate-900" role="status">${message}</p>` : ''}
+      ${passphraseField({ id: 'lk-pass', label: 'Passphrase', autocomplete: 'current-password', describedBy: 'lk-error' })}
+      <p id="lk-error" role="alert" class="min-h-5 text-sm font-medium text-rose-700 dark:text-rose-300"></p>
+      <button type="submit" class="btn-primary w-full" id="lk-submit">Unlock</button>
+      <div class="border-t border-slate-200 pt-3 dark:border-slate-800">
+        <p class="text-sm muted">${FORGOTTEN}</p>
+        <button type="button" class="btn-link !px-0" data-act="erase">Forgotten it? Start a new ledger…</button>
+      </div>
+    </form>`);
+}
+
+function setupHtml() {
+  const count = store.getTransactions().filter((t) => !t.deleted).length;
+  return lockFrame('Protect your ledger', 'A passphrase encrypts everything this app stores on this device.', html`
+    <form class="space-y-4" novalidate>
+      <ul class="space-y-1 text-sm muted">
+        <li>Your ledger is encrypted with AES-GCM before it is written to this browser.</li>
+        <li>The passphrase never leaves this device and is never stored anywhere.</li>
+        <li id="lk-existing" ${count ? '' : 'hidden'}><strong>${plural(count, 'transaction')} already on this device will be encrypted.</strong></li>
+      </ul>
+      ${passphraseField({ id: 'lk-pass', label: 'Passphrase', autocomplete: 'new-password', describedBy: 'lk-meter-text' })}
+      <div>
+        <div class="h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800" aria-hidden="true">
+          <div id="lk-meter-bar" class="h-full w-0 rounded-full transition-all"></div>
+        </div>
+        <p id="lk-meter-text" class="mt-1 min-h-10 text-sm muted" aria-live="polite">At least ${MIN_PASSPHRASE} characters. Four unrelated words are easy to remember and hard to guess.</p>
+      </div>
+      ${passphraseField({ id: 'lk-pass2', label: 'Confirm passphrase', autocomplete: 'new-password' })}
+      <p class="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100">
+        <strong>${FORGOTTEN}</strong>
+      </p>
+      <p id="lk-error" role="alert" class="min-h-5 text-sm font-medium text-rose-700 dark:text-rose-300"></p>
+      <button type="submit" class="btn-primary w-full" id="lk-submit">Encrypt my ledger</button>
+      <div class="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 pt-3 dark:border-slate-800">
+        <button type="button" class="btn-secondary" data-act="skip">Skip for now</button>
+        <button type="button" class="btn-link" data-act="restore">Restore from a backup…</button>
+      </div>
+    </form>`);
+}
+
+function damagedHtml() {
+  return lockFrame('This ledger can\'t be opened', 'The encrypted data in this browser is damaged, so no passphrase will open it.', html`
+    <div class="space-y-4">
+      <p class="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100">
+        Nothing has been deleted. If you have a backup file, restore it into a new ledger.
+      </p>
+      <button type="button" class="btn-primary w-full" data-act="restore">Restore from a backup…</button>
+      <button type="button" class="btn-danger w-full" data-act="erase">Erase this ledger and start again</button>
+    </div>`);
+}
+
+function renderLock() {
+  const root = lockEl();
+  if (lockKind === 'setup') put(root, setupHtml());
+  else if (lockKind === 'damaged') put(root, damagedHtml());
+  else put(root, unlockHtml(root.dataset.message || ''));
+  applyTheme();
+  const focus = $('#lk-pass', root) ?? $('[data-act]', root);
+  focus?.focus({ preventScroll: true });
+  if (lockKind === 'unlock') tickCountdown();
+}
+
+function showLock(kind, message = '') {
+  lockKind = kind;
+  stopAutoLock();
+  const root = lockEl();
+  root.dataset.message = message;
+  root.hidden = false;
+  $('#app-shell').hidden = true;
+  $('#app-nav').hidden = true;
+  renderLock();
+}
+
+function hideLock() {
+  lockKind = null;
+  clearTimeout(countdownTimer);
+  lockEl().replaceChildren();
+  lockEl().hidden = true;
+  $('#app-shell').hidden = false;
+  $('#app-nav').hidden = false;
+}
+
+/** While the throttle is running, the Unlock button is disabled and counts down. */
+function tickCountdown() {
+  clearTimeout(countdownTimer);
+  const btn = $('#lk-submit');
+  if (!btn) return;
+  const left = store.lockoutRemaining();
+  if (left <= 0) {
+    btn.disabled = false;
+    btn.textContent = 'Unlock';
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = `Try again in ${Math.ceil(left / 1000)}s`;
+  countdownTimer = setTimeout(tickCountdown, 250);
+}
+
+function lockError(message) {
+  const el = $('#lk-error');
+  if (el) el.textContent = message;
+}
+
+async function busy(btn, label, fn) {
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = label;
+  try { return await fn(); } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+
+async function submitUnlock() {
+  const input = $('#lk-pass');
+  lockError('');
+  try {
+    await busy($('#lk-submit'), 'Unlocking…', () => store.unlock(input.value));
+  } catch (err) {
+    if (!isFriendly(err)) throw err;
+    input.value = '';
+    lockError(err.message);
+    tickCountdown();
+    input.focus();
+    return;
+  }
+  input.value = '';
+  await openLedger();
+}
+
+function drawMeter() {
+  const value = $('#lk-pass').value;
+  const bar = $('#lk-meter-bar');
+  const text = $('#lk-meter-text');
+  if (!value) {
+    bar.style.width = '0';
+    text.textContent = `At least ${MIN_PASSPHRASE} characters. Four unrelated words are easy to remember and hard to guess.`;
+    return;
+  }
+  const { score, label, bits, hint } = passphraseStrength(value);
+  const colors = ['#dc2626', '#dc2626', '#f59e0b', '#0d9488', '#15803d'];
+  bar.style.width = `${Math.max(6, score * 25)}%`;
+  bar.style.background = colors[score];
+  text.textContent = score === 0 ? `${label} — ${hint}` : `${label} (roughly ${bits} bits) — ${hint}`;
+}
+
+async function submitSetup() {
+  const first = $('#lk-pass');
+  const second = $('#lk-pass2');
+  lockError('');
+  if (first.value.length < MIN_PASSPHRASE) {
+    lockError(`Use a passphrase of at least ${MIN_PASSPHRASE} characters.`);
+    first.focus();
+    return;
+  }
+  if (first.value !== second.value) {
+    lockError('Those two passphrases do not match.');
+    second.focus();
+    return;
+  }
+  if (passphraseStrength(first.value).score <= 1) {
+    const go = await confirmDialog({
+      title: 'Use this passphrase anyway?',
+      message: 'It would not take long to guess. Anyone who can guess it can read your ledger. A few unrelated words would be much stronger.',
+      confirmLabel: 'Use it anyway',
+      danger: true,
+    });
+    if (!go) { first.focus(); return; }
+  }
+  try {
+    await busy($('#lk-submit'), 'Encrypting…', () => store.setupEncryption(first.value));
+  } catch (err) {
+    if (!isFriendly(err)) throw err;
+    lockError(err.message);
+    return;
+  }
+  first.value = '';
+  second.value = '';
+  await openLedger();
+  toast('Your ledger is encrypted on this device');
+  // A passphrase with no backup is a single point of failure, so ask straight away.
+  if (await confirmDialog({
+    title: 'Export a backup now?',
+    message: 'An encrypted backup file is the only way back if this browser\'s data is cleared. It opens with the same passphrase.',
+    confirmLabel: 'Export encrypted backup',
+  })) await exportEncrypted();
+}
+
+async function eraseFlow() {
+  const { dlg, done } = mountDialog(html`
+    <form class="space-y-4 p-5" novalidate>
+      <h2 id="dlg-title" class="text-lg font-semibold">Erase this ledger?</h2>
+      <p class="muted">This deletes the encrypted data in this browser for good. It cannot be undone, and without the passphrase there is no way to read it anyway.</p>
+      <div>
+        <label class="field-label" for="erase-word">Type ERASE to confirm</label>
+        <input id="erase-word" class="input" autocomplete="off" autocapitalize="characters" spellcheck="false">
+      </div>
+      <div class="flex flex-wrap justify-end gap-2">
+        <button type="button" class="btn-secondary" data-close="" autofocus>Cancel</button>
+        <button type="submit" class="btn-danger">Erase everything</button>
+      </div>
+    </form>`);
+  $('form', dlg).addEventListener('submit', (e) => {
+    e.preventDefault();
+    if ($('#erase-word', dlg).value.trim().toUpperCase() === 'ERASE') dlg.close('yes');
+    else $('#erase-word', dlg).focus();
+  });
+  if (await done !== 'yes') return;
+  store.eraseEverything();
+  await openLedger();
+  toast('This ledger has been erased');
+}
+
+function wireLock() {
+  const root = lockEl();
+  root.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (lockKind === 'setup') submitSetup(); else submitUnlock();
+  });
+  root.addEventListener('input', (e) => {
+    if (e.target.id === 'lk-pass' && lockKind === 'setup') drawMeter();
+    if (e.target.type === 'password') lockError('');
+  });
+  root.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-act]');
+    if (!btn) return;
+    const { act } = btn.dataset;
+    if (act === 'skip') {
+      guard(() => store.updateSettings({ encryptionSkipped: true }));
+      await openLedger();
+      toast('Not encrypted. You can turn this on later in Settings.');
+    } else if (act === 'restore') {
+      // From the setup screen the ledger is already open, so the file can go straight in.
+      // From the damaged screen there is nothing to import into until this device is cleared.
+      if (lockKind === 'damaged') await restoreIntoNewLedger(); else $('#import-file').click();
+    } else if (act === 'erase') {
+      await eraseFlow();
+    }
+  });
+  wirePeek(root);
+}
+
+async function restoreIntoNewLedger() {
+  const go = await confirmDialog({
+    title: 'Start again and restore a backup?',
+    message: 'The damaged data in this browser is deleted first, then your backup is restored into a new ledger. Have your backup file and its passphrase ready.',
+    confirmLabel: 'Erase and restore',
+    danger: true,
+  });
+  if (!go) return;
+  store.eraseEverything();
+  hideLock();
+  mountLedger();
+  $('#import-file').click();
+}
+
+/* ---------- auto-lock ---------- */
+
+let idleTimer = 0;
+let hiddenSince = 0;
+
+const autoLockMs = () => (store.getSettings().autoLockMinutes || 0) * 60_000;
+
+function stopAutoLock() {
+  clearTimeout(idleTimer);
+  idleTimer = 0;
+}
+
+/** (Re)start the idle countdown. No timer runs unless the ledger is open and encrypted. */
+function startAutoLock() {
+  stopAutoLock();
+  if (!store.isEncrypted() || store.isLocked()) return;
+  const ms = autoLockMs();
+  if (ms) idleTimer = setTimeout(() => lockNow('Locked after a few minutes without activity.'), ms);
+}
+
+async function lockNow(message = '') {
+  if (!store.isEncrypted() || store.isLocked()) return;
+  stopAutoLock();
+  await store.lock();
+  teardownLedger();
+  showLock('unlock', message);
+}
+
+function wireAutoLock() {
+  for (const type of ['pointerdown', 'keydown', 'wheel', 'touchstart', 'focusin']) {
+    window.addEventListener(type, () => { if (idleTimer) startAutoLock(); }, { passive: true });
+  }
+  // A backgrounded tab's timers are throttled, so measure the elapsed time instead of trusting one.
+  document.addEventListener('visibilitychange', () => {
+    if (!store.isEncrypted() || store.isLocked()) return;
+    if (document.hidden) { hiddenSince = Date.now(); stopAutoLock(); return; }
+    const ms = autoLockMs();
+    if (ms && hiddenSince && Date.now() - hiddenSince > ms) {
+      lockNow('Locked while this tab was in the background.');
+      return;
+    }
+    hiddenSince = 0;
+    startAutoLock();
+  });
+}
+
+/* ---------- putting the ledger UI up and taking it down ---------- */
+
+/** Nothing decrypted may survive a lock: forms, lists and toasts all go. */
+function teardownLedger() {
+  entryForm = null;
+  hideToast();
+  for (const id of ['#entry', '#view-month', '#view-settings', '#banner']) $(id).replaceChildren();
+  for (const dlg of document.querySelectorAll('dialog[open]')) dlg.close('');
+}
+
+/** Build the ledger UI. No dialogs: the setup screen may still be sitting on top of it. */
+function mountLedger() {
+  if (!entryForm) entryForm = createTxForm($('#entry'), { prefix: 'add', mode: 'add', onSubmit: saveFromEntry });
+  showTab(ui.tab, { focus: false });
+  renderChrome();
+  startAutoLock();
+}
+
+/** Everything that may open a dialog, once the lock screen is out of the way. */
+async function finishOpen() {
+  if (!store.getSettings().currencyConfirmed) {
+    const code = await pickCurrency({ current: store.getSettings().currency, first: true });
+    guard(() => store.updateSettings({ currency: code, currencyConfirmed: true }));
+  }
+  // Unlocking returns to whichever tab was open, so the focus has to follow it there.
+  if (ui.tab === 'add') entryForm?.focusAmount();
+  else $(`#h-${ui.tab}`)?.focus({ preventScroll: true });
+}
+
+/** Leave the lock screen and hand the app back to the person. */
+async function openLedger() {
+  hideLock();
+  mountLedger();
+  await finishOpen();
+}
+
+/* ================================================================== */
 /* Shell: theme, banner, tabs, privacy button                          */
 /* ================================================================== */
 
@@ -1048,12 +1590,30 @@ function renderChrome() {
 
   const notes = [];
   if (!bootInfo.persistent) notes.push('Your browser is blocking storage, so nothing you enter will be saved. Export a backup before closing this tab.');
-  if (bootInfo.recovered) notes.push(`The saved data couldn't be read (${bootInfo.recovered}). It was set aside in this browser under "self.data.corrupt" and the app started fresh.`);
+  if (bootInfo.recovered && !store.isEncrypted()) notes.push(`The saved data couldn't be read (${bootInfo.recovered}). It was set aside in this browser under "self.data.corrupt" and the app started fresh.`);
+  // Encrypted saves happen after the change is on screen, so a failure has to be reported here.
+  if (store.getWriteError()) notes.push(`${store.getWriteError()} Your last change is on screen but not saved.`);
   put($('#banner'), html`${notes.map((n) => html`<p class="mb-4 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100" role="status">${n}</p>`)}`);
 }
 
+/**
+ * Keep the setup screen's count honest when the ledger changes underneath it — restoring a
+ * backup from that screen is the case that matters. Only this line is touched, so a
+ * half-typed passphrase survives.
+ */
+function refreshSetupCount() {
+  const el = $('#lk-existing');
+  if (!el) return;
+  const count = store.getTransactions().filter((t) => !t.deleted).length;
+  el.hidden = count === 0;
+  put(el, html`<strong>${plural(count, 'transaction')} already on this device will be encrypted.</strong>`);
+}
+
 function renderAll() {
+  if (store.isLocked()) return; // nothing to draw, and nothing decrypted to draw it from
+  if (lockKind === 'setup') refreshSetupCount();
   renderChrome();
+  startAutoLock(); // any change counts as activity, and may have changed the timeout itself
   entryForm?.refresh();
   // Views that are not on screen are emptied rather than left stale: showTab() redraws them on demand,
   // and it keeps amounts from lingering in hidden DOM after Privacy Mode is switched on.
@@ -1097,23 +1657,34 @@ function saveFromEntry(payload) {
   });
 }
 
+/** Offer encryption on a device that has never been asked and could actually use it. */
+const shouldOfferEncryption = () => !store.isEncrypted()
+  && store.isCryptoAvailable()
+  && store.isPersistent()
+  && !store.getSettings().encryptionSkipped;
+
 async function start() {
   bootInfo = store.init();
   wireShell();
-  entryForm = createTxForm($('#entry'), { prefix: 'add', mode: 'add', onSubmit: saveFromEntry });
   wireMonth();
   wireSettings();
   wireImport();
-  showTab('add', { focus: false }); // focus comes below, after any first-run dialog has closed
-  renderChrome();
+  wireLock();
+  wireAutoLock();
   store.subscribe(renderAll);
 
-  // First run: pick the currency before anything can be logged.
-  if (!store.getSettings().currencyConfirmed) {
-    const code = await pickCurrency({ current: store.getSettings().currency, first: true });
-    guard(() => store.updateSettings({ currency: code, currencyConfirmed: true }));
+  // An encrypted device always comes up locked: a refresh is not a way past the passphrase.
+  if (store.isLocked()) {
+    showLock(store.isVaultDamaged() ? 'damaged' : 'unlock');
+    return;
   }
-  entryForm.focusAmount();
+  mountLedger();
+  // First run: offer encryption before anything else, then pick the currency.
+  if (shouldOfferEncryption()) {
+    showLock('setup');
+    return;
+  }
+  await finishOpen();
 }
 
 start();

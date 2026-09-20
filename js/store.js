@@ -1,45 +1,70 @@
 // store.js — the ONLY module that reads or writes storage.
 //
-// Today the backend is one localStorage key holding one JSON document, so every change is
-// atomic. Later steps swap the backend (encrypted blob in Step 2, Supabase in Step 4) by
-// changing read()/write() below; nothing else in the app knows where the data lives.
+// Two backends live behind one API:
+//   'plain'     — Step 1: one JSON document under `self.data`. Writes are synchronous.
+//   'encrypted' — Step 2: one sealed vault under `self.vault`. Writes are asynchronous,
+//                 because encrypting is asynchronous, so they are queued (see flushVault).
+// Nothing else in the app knows which is in use, or where the data lives.
 //
-// Saved document:
+// Saved document (inside the ciphertext once encrypted):
 //   { schemaVersion, settings, categories, transactions }
 // Transaction:
 //   { id, type, amount, currency, categoryId, subCategoryId, date, note, createdAt, updatedAt, deleted }
 //   amount is an integer in the currency's smallest unit. date is a local 'YYYY-MM-DD'.
 //   Deleting only sets `deleted: true` (soft delete), which Step 4 sync needs.
+//
+// While the ledger is locked there is no state and no key in memory: reads return empty
+// values and every write throws. The key is only ever a non-extractable CryptoKey.
 
 import {
   defaultCategories, sanitizeCategories, mergeCategories, newId, noteRequired, findMain, findSub, SchemaError,
 } from './schema.js';
 import { DEFAULT_CURRENCY, isCurrencyCode, currencyInfo, rescale } from './money.js';
+import * as vault from './crypto.js';
 
 export const SCHEMA_VERSION = 1;
 export class StoreError extends Error {}
 
 const KEY = 'self.data';
+const VAULT_KEY = 'self.vault';
 const CORRUPT_KEY = 'self.data.corrupt';
+const LOCKOUT_KEY = 'self.lockout';
+const PROBE_KEY = 'self.probe';
 const THEMES = ['system', 'light', 'dark'];
 const NOTE_MAX = 500;
+
+/** Minutes of inactivity before auto-lock. 0 means never. */
+export const AUTO_LOCK_CHOICES = [1, 5, 15, 30, 0];
+export const MIN_PASSPHRASE = vault.MIN_PASSPHRASE;
 
 let state = null;
 let persistent = true;
 let recovered = null;
+let mode = 'plain';      // 'plain' | 'encrypted'
+let locked = false;
+let damaged = false;     // a vault is present but unreadable
+let key = null;          // CryptoKey — memory only, never persisted in any form
+let envelope = null;     // the sealed vault, minus the plaintext it protects
+let writeError = null;
 const listeners = new Set();
 
 /* ------------------------------------------------------------------ */
 /* Backend (the only place that touches localStorage)                  */
 /* ------------------------------------------------------------------ */
 
-function read() {
-  return localStorage.getItem(KEY);
+function readRaw(name) {
+  return localStorage.getItem(name);
 }
 
-function write(text) {
-  localStorage.setItem(KEY, text);
+function writeRaw(name, text) {
+  try {
+    localStorage.setItem(name, text);
+  } catch {
+    throw new StoreError('Could not save: browser storage is full or blocked. Export a backup to be safe.');
+  }
 }
+
+const removeRaw = (name) => { try { localStorage.removeItem(name); } catch { /* nothing to do */ } };
 
 /* ------------------------------------------------------------------ */
 /* Schema versions and migrations                                      */
@@ -125,6 +150,8 @@ function cleanSettings(raw = {}) {
     currencyConfirmed: raw.currencyConfirmed === true,
     privacyMode: raw.privacyMode === true,
     theme: THEMES.includes(raw.theme) ? raw.theme : 'system',
+    autoLockMinutes: AUTO_LOCK_CHOICES.includes(raw.autoLockMinutes) ? raw.autoLockMinutes : 5,
+    encryptionSkipped: raw.encryptionSkipped === true,
   };
 }
 
@@ -157,9 +184,9 @@ const freshState = () => ({
 /* Lifecycle                                                           */
 /* ------------------------------------------------------------------ */
 
-function load() {
+function loadPlain() {
   let text;
-  try { text = read(); } catch { persistent = false; return null; }
+  try { text = readRaw(KEY); } catch { persistent = false; return null; }
   if (text == null) return null;
   try {
     return normalize(migrate(JSON.parse(text))).data;
@@ -171,23 +198,70 @@ function load() {
   }
 }
 
-function onStorageEvent(e) {
-  if (e.key !== null && e.key !== KEY) return;
-  state = load() ?? freshState();
-  notify();
+/** Parse the sealed vault, if there is one. A present-but-broken vault sets `damaged`. */
+function loadEnvelope() {
+  let text;
+  try { text = readRaw(VAULT_KEY); } catch { return null; }
+  if (text == null) return null;
+  try {
+    return vault.validateEnvelope(JSON.parse(text));
+  } catch (err) {
+    damaged = true;
+    recovered = err.message;
+    return null;
+  }
 }
 
-/** Call once at startup. → { persistent, recovered } so the UI can warn if storage is unusable. */
+/**
+ * Call once at startup. Never decrypts: an encrypted device comes up locked, so a refresh
+ * always needs the passphrase again.
+ * → { mode, locked, damaged, persistent, recovered }
+ */
 export function init() {
   persistent = true;
   recovered = null;
+  damaged = false;
+  writeError = null;
+  key = null;
+  envelope = null;
+  pending = null;
+  writeChain = Promise.resolve();
   try {
-    localStorage.setItem('self.probe', '1');
-    localStorage.removeItem('self.probe');
+    localStorage.setItem(PROBE_KEY, '1');
+    localStorage.removeItem(PROBE_KEY);
   } catch { persistent = false; }
-  state = (persistent ? load() : null) ?? freshState();
+
+  const found = persistent ? loadEnvelope() : null;
+  if (found || damaged) {
+    mode = 'encrypted';
+    locked = true;
+    envelope = found;
+    state = null;
+  } else {
+    mode = 'plain';
+    locked = false;
+    state = (persistent ? loadPlain() : null) ?? freshState();
+  }
   if (typeof window !== 'undefined') window.addEventListener('storage', onStorageEvent);
-  return { persistent, recovered };
+  return { mode, locked, damaged, persistent, recovered };
+}
+
+async function onStorageEvent(e) {
+  if (e.key !== null && e.key !== KEY && e.key !== VAULT_KEY) return;
+  if (mode === 'encrypted') {
+    if (locked) return;
+    const found = loadEnvelope();
+    // The vault was removed, or re-keyed in another tab: this tab can no longer read it.
+    if (!found || found.salt !== envelope?.salt) { await lock(); return; }
+    envelope = found;
+    try {
+      state = normalize(migrate(await vault.open(key, found.iv, found.ciphertext))).data;
+      notify();
+    } catch { await lock(); }
+    return;
+  }
+  state = loadPlain() ?? freshState();
+  notify();
 }
 
 function notify() {
@@ -199,12 +273,57 @@ export function subscribe(fn) {
   return () => listeners.delete(fn);
 }
 
+/* ------------------------------------------------------------------ */
+/* Writing                                                             */
+/* ------------------------------------------------------------------ */
+
+let writeChain = Promise.resolve();
+let pending = null;
+
+/**
+ * Encrypted writes can't be synchronous, so they are queued: the newest document wins and
+ * only one encrypt/write runs at a time. A failure is reported through getWriteError()
+ * rather than thrown, because by then the caller has long since returned.
+ */
+function queueVaultWrite(doc) {
+  pending = doc;
+  writeChain = writeChain.then(flushVault);
+  return writeChain;
+}
+
+async function flushVault() {
+  const doc = pending;
+  if (!doc || !key || !envelope) return;
+  pending = null;
+  try {
+    const sealed = await vault.seal(key, doc, envelope.schemaVersion);
+    writeRaw(VAULT_KEY, JSON.stringify({ ...envelope, ...sealed }));
+    if (writeError) { writeError = null; notify(); }
+  } catch (err) {
+    writeError = err instanceof StoreError ? err.message : `Could not save your last change: ${err.message}`;
+    notify();
+  }
+}
+
+/** Resolves once every queued encrypted write has landed. */
+export const flush = () => writeChain;
+export const getWriteError = () => writeError;
+
+/**
+ * Guard for everything that reads or writes the open ledger. While locked there is no state
+ * at all, so this has to come before any field of it is touched.
+ */
+function requireOpen() {
+  if (locked || !state) throw new StoreError('The ledger is locked.');
+}
+
 /** Swap in a new state, persist it, and tell listeners. If saving fails the old state is kept. */
 function commit(next) {
+  requireOpen();
   if (persistent) {
-    try { write(JSON.stringify(next)); } catch {
-      throw new StoreError('Could not save: browser storage is full or blocked. Export a backup to be safe.');
-    }
+    // Plain mode writes synchronously and throws on failure, exactly as in Step 1.
+    if (mode === 'plain') writeRaw(KEY, JSON.stringify(next));
+    else queueVaultWrite(next);
   }
   state = next;
   notify();
@@ -214,25 +333,221 @@ function commit(next) {
 /* Reads (treat the returned objects as read-only)                     */
 /* ------------------------------------------------------------------ */
 
+const LOCKED_SETTINGS = Object.freeze(cleanSettings());
+
 export const getState = () => state;
-export const getSettings = () => state.settings;
-export const getCategories = () => state.categories;
-export const getTransactions = () => state.transactions;
+export const getSettings = () => state?.settings ?? LOCKED_SETTINGS;
+export const getCategories = () => state?.categories ?? [];
+export const getTransactions = () => state?.transactions ?? [];
 export const isPersistent = () => persistent;
+export const isEncrypted = () => mode === 'encrypted';
+export const isLocked = () => locked;
+export const isVaultDamaged = () => damaged;
+export const isCryptoAvailable = () => vault.isAvailable();
 /** Rough size of the saved document (localStorage stores UTF-16, ~2 bytes per character). */
-export const approxBytes = () => JSON.stringify(state).length * 2;
+export const approxBytes = () => (state ? JSON.stringify(state).length * 2 : 0);
+
+/* ------------------------------------------------------------------ */
+/* Encryption: set up, lock, unlock, re-key                            */
+/* ------------------------------------------------------------------ */
+
+function assertPassphrase(passphrase) {
+  if (typeof passphrase !== 'string' || passphrase.length < MIN_PASSPHRASE) {
+    throw new StoreError(`Use a passphrase of at least ${MIN_PASSPHRASE} characters.`);
+  }
+}
+
+const asStoreError = (err) => (err instanceof vault.CryptoError ? new StoreError(err.message) : err);
+
+/** Read back what actually landed in storage, with a key derived afresh from the passphrase. */
+async function verifyVault(passphrase, expected) {
+  const stored = JSON.parse(readRaw(VAULT_KEY));
+  const env = vault.validateEnvelope(stored);
+  const proof = await vault.deriveKey(passphrase, env.salt, env.schemaVersion);
+  if (!(await vault.checkKey(proof, env.check))) throw new StoreError('The encrypted copy could not be verified.');
+  const back = await vault.open(proof, env.iv, env.ciphertext);
+  if (JSON.stringify(back) !== JSON.stringify(expected)) throw new StoreError('The encrypted copy did not read back correctly.');
+  return env;
+}
+
+/**
+ * Encrypt what is on this device for the first time (Step 1 data included).
+ *
+ * The order matters: write the vault, PROVE it decrypts with a freshly derived key, and only
+ * then delete the plaintext. If anything fails the vault is removed and the plaintext is left
+ * exactly where it was, so a failure can never cost data.
+ */
+export async function setupEncryption(passphrase) {
+  if (mode === 'encrypted') throw new StoreError('This device is already encrypted.');
+  if (!persistent) throw new StoreError('This browser is blocking storage, so there is nothing to encrypt.');
+  assertPassphrase(passphrase);
+  const doc = state;
+  try {
+    const salt = vault.newSalt();
+    const fresh = await vault.deriveKey(passphrase, salt, vault.VAULT_VERSION);
+    const check = await vault.makeCheck(fresh, vault.VAULT_VERSION);
+    const sealed = await vault.seal(fresh, doc, vault.VAULT_VERSION);
+    const env = { schemaVersion: vault.VAULT_VERSION, salt: vault.toBase64(salt), check, ...sealed };
+    writeRaw(VAULT_KEY, JSON.stringify(env));
+    await verifyVault(passphrase, doc);
+    removeRaw(KEY); // the plaintext copy goes only once the vault has proven readable
+    mode = 'encrypted';
+    locked = false;
+    damaged = false;
+    key = fresh;
+    envelope = env;
+    clearFailures();
+    notify();
+  } catch (err) {
+    removeRaw(VAULT_KEY); // leave the device exactly as it was
+    throw asStoreError(err);
+  }
+}
+
+/** Forget the key and the decrypted ledger. Any queued write lands first. */
+export async function lock() {
+  if (mode !== 'encrypted' || locked) return;
+  try { await writeChain; } catch { /* reported through writeError */ }
+  key = null;
+  state = null;
+  pending = null;
+  locked = true;
+  notify();
+}
+
+/**
+ * Derive the key and decrypt. The check value is tested first, so a wrong passphrase is
+ * reported as such and a right passphrase over damaged data gets its own message.
+ */
+export async function unlock(passphrase) {
+  if (mode !== 'encrypted') throw new StoreError('This device is not encrypted.');
+  if (damaged || !envelope) throw new StoreError('The encrypted data on this device is damaged. Restore from a backup.');
+  const wait = lockoutRemaining();
+  if (wait > 0) throw new StoreError(`Too many attempts. Wait ${Math.ceil(wait / 1000)} seconds and try again.`);
+
+  let candidate;
+  try {
+    candidate = await vault.deriveKey(passphrase, envelope.salt, envelope.schemaVersion);
+  } catch (err) { throw asStoreError(err); }
+
+  if (!(await vault.checkKey(candidate, envelope.check))) {
+    recordFailure();
+    throw new StoreError('Incorrect passphrase.');
+  }
+
+  let doc;
+  try {
+    doc = await vault.open(candidate, envelope.iv, envelope.ciphertext);
+  } catch {
+    throw new StoreError('That passphrase is correct, but the saved data is damaged. Restore from your most recent backup.');
+  }
+
+  state = normalize(migrate(doc)).data;
+  key = candidate;
+  locked = false;
+  writeError = null;
+  clearFailures();
+  notify();
+}
+
+/** Re-encrypt everything under a new salt and a new key. The old vault is restored on failure. */
+export async function changePassphrase(current, next) {
+  if (mode !== 'encrypted' || locked) throw new StoreError('Unlock the ledger first.');
+  assertPassphrase(next);
+  // Captured before the first await: auto-lock can fire part way through this, and locking
+  // sets `state` to null. Re-reading it later would seal an empty ledger over a full one.
+  const doc = state;
+  const proof = await vault.deriveKey(current, envelope.salt, envelope.schemaVersion).catch((err) => { throw asStoreError(err); });
+  if (!(await vault.checkKey(proof, envelope.check))) {
+    recordFailure();
+    throw new StoreError('That is not your current passphrase.');
+  }
+  try { await writeChain; } catch { /* reported through writeError */ }
+  // If the ledger locked while the old passphrase was being checked, stop before touching the
+  // vault: the old passphrase keeps working and nothing is lost.
+  if (locked) throw new StoreError('The ledger locked before the passphrase could be changed. Unlock and try again.');
+
+  const previous = readRaw(VAULT_KEY);
+  try {
+    const salt = vault.newSalt();
+    const fresh = await vault.deriveKey(next, salt, vault.VAULT_VERSION);
+    const check = await vault.makeCheck(fresh, vault.VAULT_VERSION);
+    const sealed = await vault.seal(fresh, doc, vault.VAULT_VERSION);
+    const env = { schemaVersion: vault.VAULT_VERSION, salt: vault.toBase64(salt), check, ...sealed };
+    writeRaw(VAULT_KEY, JSON.stringify(env));
+    await verifyVault(next, doc);
+    // The envelope always follows what is on disk, so a later unlock uses the new salt. The key
+    // only comes back if auto-lock didn't fire while this was running — it must not outlive a lock.
+    envelope = env;
+    if (!locked) key = fresh;
+    clearFailures();
+    notify();
+  } catch (err) {
+    if (previous != null) { try { localStorage.setItem(VAULT_KEY, previous); } catch { /* keep going */ } }
+    throw asStoreError(err);
+  }
+}
+
+/**
+ * Erase everything on this device. The only way past a forgotten passphrase, and it is
+ * exactly as destructive as it sounds.
+ */
+export function eraseEverything() {
+  removeRaw(VAULT_KEY);
+  removeRaw(KEY);
+  removeRaw(CORRUPT_KEY);
+  removeRaw(LOCKOUT_KEY);
+  key = null;
+  envelope = null;
+  damaged = false;
+  mode = 'plain';
+  locked = false;
+  state = freshState();
+  notify();
+}
+
+/* ------------------------------------------------------------------ */
+/* Wrong-passphrase throttle                                           */
+/* ------------------------------------------------------------------ */
+
+// How long to wait after the nth consecutive wrong attempt (indexed by n, so two slips are
+// free). This slows a person at the keyboard; it is not the defence against an offline
+// attack on a copied file — 600,000 PBKDF2 iterations are.
+const DELAYS_MS = [0, 0, 0, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
+
+function readLockout() {
+  try {
+    const parsed = JSON.parse(readRaw(LOCKOUT_KEY) ?? 'null');
+    if (parsed && Number.isInteger(parsed.fails)) return parsed;
+  } catch { /* fall through */ }
+  return { fails: 0, until: 0 };
+}
+
+function recordFailure() {
+  const fails = readLockout().fails + 1;
+  const wait = DELAYS_MS[Math.min(fails, DELAYS_MS.length - 1)];
+  try { localStorage.setItem(LOCKOUT_KEY, JSON.stringify({ fails, until: Date.now() + wait })); } catch { /* best effort */ }
+}
+
+const clearFailures = () => removeRaw(LOCKOUT_KEY);
+
+/** Milliseconds still to wait before another attempt is accepted. */
+export const lockoutRemaining = () => Math.max(0, (readLockout().until || 0) - Date.now());
+export const failedAttempts = () => readLockout().fails;
 
 /* ------------------------------------------------------------------ */
 /* Settings                                                            */
 /* ------------------------------------------------------------------ */
 
 export function updateSettings(patch) {
+  requireOpen();
   const settings = cleanSettings({ ...state.settings, ...patch });
   commit({ ...state, settings });
 }
 
 /** What changing currency would do — used to warn before it happens. Counts visible transactions. */
 export function previewCurrencyChange(code) {
+  requireOpen();
   const from = currencyInfo(state.settings.currency).decimals;
   const to = currencyInfo(code).decimals;
   let count = 0;
@@ -250,6 +565,7 @@ export function previewCurrencyChange(code) {
  * 50,000 UGX stays 50,000 (stored as 50000 UGX → 5000000 minor units in USD).
  */
 export function changeCurrency(code) {
+  requireOpen();
   if (!isCurrencyCode(code)) throw new StoreError('That is not a valid currency code.');
   const from = currencyInfo(state.settings.currency).decimals;
   const to = currencyInfo(code).decimals;
@@ -268,6 +584,7 @@ export function changeCurrency(code) {
 
 /** Persist a tree produced by the schema.js editors. */
 export function saveCategories(categories) {
+  requireOpen();
   commit({ ...state, categories: sanitizeCategories(categories) });
 }
 
@@ -290,6 +607,7 @@ const FIELDS = ['type', 'amount', 'categoryId', 'subCategoryId', 'date', 'note']
 const pick = (obj) => Object.fromEntries(FIELDS.filter((k) => k in obj).map((k) => [k, obj[k]]));
 
 export function addTransaction(input) {
+  requireOpen();
   const stamp = nowIso();
   const candidate = {
     subCategoryId: null, note: '', ...pick(input),
@@ -304,6 +622,7 @@ export function addTransaction(input) {
 }
 
 export function updateTransaction(id, patch) {
+  requireOpen();
   const current = state.transactions.find((t) => t.id === id && !t.deleted);
   if (!current) throw new StoreError('That transaction no longer exists.');
   const { tx, reason } = cleanTransaction({ ...current, ...pick(patch), updatedAt: nowIso() });
@@ -315,6 +634,7 @@ export function updateTransaction(id, patch) {
 }
 
 function setDeleted(id, deleted) {
+  requireOpen();
   if (!state.transactions.some((t) => t.id === id)) throw new StoreError('That transaction no longer exists.');
   const stamp = nowIso();
   commit({
@@ -333,6 +653,7 @@ export const restoreTransaction = (id) => setDeleted(id, false);
 
 /** The full backup document: settings, category schema, and every transaction (deleted ones too). */
 export function exportBackup() {
+  requireOpen();
   return {
     app: 'S.E.L.F',
     schemaVersion: SCHEMA_VERSION,
@@ -344,12 +665,26 @@ export function exportBackup() {
 }
 
 /**
- * Parse and validate backup text. Throws StoreError with a plain-language reason if the file
- * is unusable; invalid individual records are skipped and counted instead.
+ * The same backup document, sealed with this device's key: a .self file that only this
+ * passphrase opens. Restoring it on another browser needs nothing but the passphrase.
  */
-export function parseBackup(text) {
-  let raw;
-  try { raw = JSON.parse(text); } catch { throw new StoreError('That file is not valid JSON.'); }
+export async function exportEncryptedBackup() {
+  if (mode !== 'encrypted' || locked) throw new StoreError('Unlock the ledger first.');
+  const sealed = await vault.seal(key, exportBackup(), envelope.schemaVersion);
+  return JSON.stringify({
+    schemaVersion: envelope.schemaVersion,
+    salt: envelope.salt,
+    check: envelope.check,
+    ...sealed,
+  }, null, 2);
+}
+
+/** True when this text is a sealed .self file rather than a plain JSON backup. */
+export function looksEncrypted(text) {
+  try { return vault.isEnvelope(JSON.parse(text)); } catch { return false; }
+}
+
+function parseBackupDocument(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !Array.isArray(raw.transactions)) {
     throw new StoreError('This does not look like a S.E.L.F backup (no transaction list found).');
   }
@@ -363,8 +698,37 @@ export function parseBackup(text) {
   }
 }
 
+/**
+ * Parse and validate backup text. Throws StoreError with a plain-language reason if the file
+ * is unusable; invalid individual records are skipped and counted instead.
+ */
+export function parseBackup(text) {
+  let raw;
+  try { raw = JSON.parse(text); } catch { throw new StoreError('That file is not valid JSON.'); }
+  return parseBackupDocument(raw);
+}
+
+/** The same, for a sealed .self file. Needs the passphrase that file was written with. */
+export async function parseEncryptedBackup(text, passphrase) {
+  let raw;
+  try { raw = JSON.parse(text); } catch { throw new StoreError('That file is not valid JSON.'); }
+  let env;
+  try { env = vault.validateEnvelope(raw); } catch (err) { throw asStoreError(err); }
+
+  let fileKey;
+  try { fileKey = await vault.deriveKey(passphrase, env.salt, env.schemaVersion); } catch (err) { throw asStoreError(err); }
+  if (!(await vault.checkKey(fileKey, env.check))) throw new StoreError('Incorrect passphrase for this backup file.');
+
+  let doc;
+  try { doc = await vault.open(fileKey, env.iv, env.ciphertext); } catch {
+    throw new StoreError('That passphrase is correct, but this backup file is damaged.');
+  }
+  return parseBackupDocument(doc);
+}
+
 /** Compare a parsed backup with what is on this device, for the "Merge or replace?" dialog. */
 export function previewImport({ backup, skipped, exportedAt }) {
+  requireOpen();
   const local = new Map(state.transactions.map((t) => [t.id, t]));
   let added = 0;
   let updated = 0;
@@ -395,18 +759,22 @@ export function previewImport({ backup, skipped, exportedAt }) {
  * Apply a parsed backup.
  *   'replace' — this device becomes exactly the backup.
  *   'merge'   — union by transaction id; on a clash the newer updatedAt wins; categories are unioned.
+ *
+ * Encryption is a property of the device, not of the backup: whatever passphrase protects this
+ * device keeps protecting it afterwards.
  */
-export function applyImport({ backup }, mode) {
-  if (mode === 'replace') {
+export function applyImport({ backup }, mode_) {
+  requireOpen();
+  if (mode_ === 'replace') {
     commit({
       schemaVersion: SCHEMA_VERSION,
-      settings: { ...backup.settings, currencyConfirmed: true },
+      settings: { ...cleanSettings(backup.settings), currencyConfirmed: true },
       categories: backup.categories,
       transactions: backup.transactions,
     });
     return;
   }
-  if (mode !== 'merge') throw new StoreError('Unknown import mode.');
+  if (mode_ !== 'merge') throw new StoreError('Unknown import mode.');
   if (state.transactions.length > 0 && backup.settings.currency !== state.settings.currency) {
     throw new StoreError(`The backup is in ${backup.settings.currency} but this device uses ${state.settings.currency}.`);
   }
