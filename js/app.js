@@ -1055,8 +1055,10 @@ function renderChrome() {
 function renderAll() {
   renderChrome();
   entryForm?.refresh();
-  if (ui.tab === 'month') renderMonth();
-  if (ui.tab === 'settings') renderSettings();
+  // Views that are not on screen are emptied rather than left stale: showTab() redraws them on demand,
+  // and it keeps amounts from lingering in hidden DOM after Privacy Mode is switched on.
+  if (ui.tab === 'month') renderMonth(); else $('#view-month').replaceChildren();
+  if (ui.tab === 'settings') renderSettings(); else $('#view-settings').replaceChildren();
 }
 
 function showTab(tab, { focus = true } = {}) {
