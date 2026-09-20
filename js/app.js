@@ -1,0 +1,1117 @@
+// app.js — UI wiring and rendering.
+// All data goes through store.js; this file never touches storage. Category rules live in
+// schema.js, money maths in money.js, files in backup.js.
+
+import * as store from './store.js';
+import * as schema from './schema.js';
+import * as money from './money.js';
+import { buildCsv, download, stamp } from './backup.js';
+
+/* ================================================================== */
+/* Small helpers                                                       */
+/* ================================================================== */
+
+const $ = (selector, root = document) => root.querySelector(selector);
+
+// html`…` escapes every interpolated value unless it is itself html`…` output. User text
+// (notes, category names, imported data) can therefore never inject markup.
+class Safe { constructor(s) { this.s = s; } }
+const escapeHtml = (v) => String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+function part(v) {
+  if (v instanceof Safe) return v.s;
+  if (Array.isArray(v)) return v.map(part).join('');
+  if (v === null || v === undefined || v === false) return '';
+  return escapeHtml(v);
+}
+const html = (strings, ...values) => new Safe(strings.reduce((out, s, i) => out + s + (i < values.length ? part(values[i]) : ''), ''));
+const put = (el, safe) => { el.innerHTML = safe.s; };
+
+const ICONS = {
+  eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  eyeOff: '<path d="M3 3l18 18"/><path d="M6.6 6.6C3.7 8.5 2 12 2 12s3.5 7 10 7c1.7 0 3.2-.4 4.5-1M10.6 5.1A10 10 0 0 1 12 5c6.5 0 10 7 10 7a17 17 0 0 1-3.2 4.2"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+  cog: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
+  pencil: '<path d="M4 20h4L19 9l-4-4L4 16v4z"/><path d="M13.5 6.5l4 4"/>',
+  trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
+  up: '<path d="M6 15l6-6 6 6"/>',
+  down: '<path d="M6 9l6 6 6-6"/>',
+  left: '<path d="M15 6l-6 6 6 6"/>',
+  right: '<path d="M9 6l6 6-6 6"/>',
+};
+const icon = (name, size = 22) => html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${new Safe(ICONS[name])}</svg>`;
+
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+/* ---------- dates (all local; a transaction date is a plain 'YYYY-MM-DD') ---------- */
+
+const pad = (n) => String(n).padStart(2, '0');
+const toDateStr = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const todayStr = () => toDateStr(new Date());
+const monthOf = (dateStr) => dateStr.slice(0, 7);
+const dateFromStr = (s) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
+const shiftMonth = (key, delta) => { const [y, m] = key.split('-').map(Number); return monthOf(toDateStr(new Date(y, m - 1 + delta, 1))); };
+
+const locale = navigator.languages?.[0] || 'en';
+const fmtDay = new Intl.DateTimeFormat(locale, { weekday: 'short', day: 'numeric', month: 'short' });
+const fmtFull = new Intl.DateTimeFormat(locale, { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+const fmtMonth = new Intl.DateTimeFormat(locale, { month: 'long', year: 'numeric' });
+const fmtStamp = new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeStyle: 'short' });
+
+function relativeDay(dateStr) {
+  const today = new Date();
+  if (dateStr === toDateStr(today)) return 'Today';
+  if (dateStr === toDateStr(new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1))) return 'Yesterday';
+  return null;
+}
+const dayLabel = (dateStr) => { const rel = relativeDay(dateStr); const d = fmtDay.format(dateFromStr(dateStr)); return rel ? `${rel} · ${d}` : d; };
+const fullDateLabel = (dateStr) => relativeDay(dateStr) ?? fmtFull.format(dateFromStr(dateStr));
+
+/* ---------- money on screen (Privacy Mode is enforced here, in one place) ---------- */
+
+const privacyOn = () => store.getSettings().privacyMode;
+const currencyCode = () => store.getSettings().currency;
+
+/** Amount as HTML. With Privacy Mode on, no digits reach the DOM at all. */
+function amountHtml(minor, sign = '') {
+  if (privacyOn()) return html`<span aria-hidden="true">••••</span><span class="sr-only">amount hidden</span>`;
+  return html`${sign}${money.formatMoney(minor, currencyCode())}`;
+}
+
+/* ---------- errors ---------- */
+
+const isFriendly = (err) => err instanceof store.StoreError || err instanceof schema.SchemaError;
+
+/** Run something that may throw a plain-language error and show it as a toast. */
+function guard(fn) {
+  try { return fn(); } catch (err) {
+    if (!isFriendly(err)) throw err;
+    toast(err.message);
+    return undefined;
+  }
+}
+
+/* ================================================================== */
+/* UI state (not persisted)                                            */
+/* ================================================================== */
+
+const ui = {
+  tab: 'add',
+  month: monthOf(todayStr()),
+  filterType: 'all',
+  filterMain: 'all',
+  settingsType: 'expense',
+  openMains: new Set(),
+};
+let entryForm = null;
+let bootInfo = { persistent: true, recovered: null };
+
+/** Re-render a region but keep keyboard focus on the same control (found by data-key). */
+function withFocus(container, render) {
+  const active = document.activeElement;
+  const key = active && container.contains(active) ? active.dataset.key : null;
+  render();
+  if (!key) return;
+  const find = (k) => container.querySelector(`[data-key="${CSS.escape(k)}"]:not(:disabled)`);
+  let target = find(key);
+  if (!target) { // e.g. a move-up button that just became disabled at the top of the list
+    const [kind, ...rest] = key.split(':');
+    const twin = { up: 'down', down: 'up' }[kind];
+    if (twin) target = find([twin, ...rest].join(':'));
+  }
+  target?.focus({ preventScroll: true });
+}
+
+/* ================================================================== */
+/* Toast and dialogs                                                   */
+/* ================================================================== */
+
+let toastTimer = 0;
+
+function hideToast() {
+  clearTimeout(toastTimer);
+  $('#toast').replaceChildren();
+}
+
+function toast(message, { action = null, onAction = null, ms = 6000 } = {}) {
+  clearTimeout(toastTimer);
+  const el = $('#toast');
+  put(el, html`
+    <div class="flex max-w-md items-center gap-2 rounded-2xl bg-slate-900 py-1 pl-4 pr-1 text-sm text-white shadow-lg dark:bg-slate-100 dark:text-slate-900">
+      <span class="py-2">${message}</span>
+      ${action ? html`<button type="button" class="pointer-events-auto min-h-11 rounded-xl px-3 font-semibold text-teal-300 hover:bg-white/10 dark:text-teal-800 dark:hover:bg-slate-900/10" data-toast-action>${action}</button>` : ''}
+    </div>`);
+  $('[data-toast-action]', el)?.addEventListener('click', () => { hideToast(); onAction?.(); });
+  toastTimer = setTimeout(hideToast, ms);
+}
+
+/**
+ * Show a modal <dialog>. Buttons with data-close="value" close it with that value.
+ * Resolves with the closing value ('' when dismissed with Esc or a backdrop click).
+ */
+function mountDialog(content, { dismissible = true } = {}) {
+  const dlg = document.createElement('dialog');
+  dlg.className = 'sheet';
+  dlg.setAttribute('aria-labelledby', 'dlg-title');
+  dlg.innerHTML = content.s;
+  let pressedOnBackdrop = false;
+  dlg.addEventListener('pointerdown', (e) => { pressedOnBackdrop = e.target === dlg; });
+  dlg.addEventListener('click', (e) => {
+    const closer = e.target.closest('[data-close]');
+    if (closer) dlg.close(closer.dataset.close);
+    else if (dismissible && e.target === dlg && pressedOnBackdrop) dlg.close('');
+  });
+  if (!dismissible) dlg.addEventListener('cancel', (e) => e.preventDefault());
+  const done = new Promise((resolve) => {
+    dlg.addEventListener('close', () => { dlg.remove(); resolve(dlg.returnValue); }, { once: true });
+  });
+  document.body.append(dlg);
+  dlg.showModal();
+  return { dlg, done };
+}
+
+async function confirmDialog({ title, message, confirmLabel, danger = false }) {
+  const { done } = mountDialog(html`
+    <div class="space-y-4 p-5">
+      <h2 id="dlg-title" class="text-lg font-semibold">${title}</h2>
+      <p class="muted">${message}</p>
+      <div class="flex flex-wrap justify-end gap-2">
+        <button type="button" class="btn-secondary" data-close="" autofocus>Cancel</button>
+        <button type="button" class="${danger ? 'btn-danger' : 'btn-primary'}" data-close="yes">${confirmLabel}</button>
+      </div>
+    </div>`);
+  return (await done) === 'yes';
+}
+
+async function alertDialog(title, message) {
+  const { done } = mountDialog(html`
+    <div class="space-y-4 p-5">
+      <h2 id="dlg-title" class="text-lg font-semibold">${title}</h2>
+      <p class="muted">${message}</p>
+      <div class="flex justify-end"><button type="button" class="btn-primary" data-close="ok" autofocus>OK</button></div>
+    </div>`);
+  await done;
+}
+
+/* ================================================================== */
+/* Transaction form (used for "Add" and for the edit dialog)           */
+/* ================================================================== */
+
+function amountMessage(error, code, decimals) {
+  switch (error) {
+    case 'empty': return 'Enter an amount.';
+    case 'invalid': return decimals ? 'Use digits only, for example 1250.50.' : 'Use digits only, for example 50000.';
+    case 'no-decimals': return `${code} has no decimal places. Enter a whole number.`;
+    case 'too-many-decimals': return `${code} allows at most ${decimals} decimal places.`;
+    case 'zero': return 'The amount must be more than zero.';
+    default: return 'That amount is too large.';
+  }
+}
+
+function createTxForm(root, { prefix, mode, tx = null, onSubmit, onCancel = null }) {
+  const editing = mode === 'edit';
+  const p = (name) => `${prefix}-${name}`;
+  const st = {
+    type: tx?.type ?? 'expense',
+    mainId: tx?.categoryId ?? null,
+    subId: tx?.subCategoryId ?? null,
+    date: tx?.date ?? todayStr(),
+    showDate: editing,
+    showNote: Boolean(tx?.note),
+  };
+
+  put(root, html`
+    <form novalidate autocomplete="off" class="space-y-5">
+      <div class="seg-wrap" role="radiogroup" aria-label="Type">
+        ${['expense', 'income'].map((t) => html`
+          <label class="seg"><input type="radio" class="sr-only" name="${p('type')}" value="${t}" ${st.type === t ? 'checked' : ''}><span class="seg-face">${t === 'expense' ? 'Expense' : 'Income'}</span></label>`)}
+      </div>
+
+      <div>
+        <label class="field-label" for="${p('amount')}">Amount</label>
+        <div class="flex items-center rounded-2xl border border-slate-300 bg-white focus-within:ring-2 focus-within:ring-teal-600 dark:border-slate-600 dark:bg-slate-950">
+          <span id="${p('symbol')}" class="pl-4 text-lg font-medium text-slate-600 dark:text-slate-400" aria-hidden="true"></span>
+          <input id="${p('amount')}" type="text" style="outline: none" placeholder="0" autocomplete="off" autocapitalize="off" spellcheck="false"
+                 enterkeyhint="done" aria-describedby="${p('hint')} ${p('error')}"
+                 class="min-h-14 w-full min-w-0 bg-transparent px-3 text-3xl font-semibold tabular-nums placeholder:text-slate-400">
+        </div>
+        <p id="${p('hint')}" class="mt-1 min-h-5 text-sm muted"></p>
+      </div>
+
+      <fieldset>
+        <legend class="field-label">Category</legend>
+        <div id="${p('grid')}" class="grid grid-cols-3 gap-2 sm:grid-cols-4"></div>
+      </fieldset>
+
+      <fieldset id="${p('subs')}">
+        <legend class="field-label">Sub-category</legend>
+        <div id="${p('chips')}" class="flex flex-wrap gap-2"></div>
+      </fieldset>
+
+      <div>
+        <div class="flex items-center justify-between gap-2" id="${p('date-row')}">
+          <p class="text-sm"><span class="muted">Date:</span> <strong id="${p('date-label')}"></strong></p>
+          <button type="button" class="btn-link" id="${p('date-toggle')}" data-act="toggle-date" aria-expanded="false" aria-controls="${p('date-field')}">Change date</button>
+        </div>
+        <div id="${p('date-field')}" class="mt-2" hidden>
+          <label class="field-label" for="${p('date')}">Date</label>
+          <input id="${p('date')}" type="date" class="input">
+        </div>
+      </div>
+
+      <div>
+        <button type="button" class="btn-link" id="${p('note-toggle')}" data-act="toggle-note" aria-expanded="false" aria-controls="${p('note-field')}">+ Add note</button>
+        <div id="${p('note-field')}" hidden>
+          <label class="field-label" id="${p('note-label')}" for="${p('note')}">Note (optional)</label>
+          <input id="${p('note')}" type="text" class="input" maxlength="500" enterkeyhint="done" autocomplete="off">
+        </div>
+      </div>
+
+      <div class="save-bar ${editing ? 'in-dialog' : ''}">
+        <p id="${p('error')}" role="alert" class="save-error text-sm font-medium text-rose-700 dark:text-rose-300"></p>
+        <div class="flex gap-2">
+          <button type="submit" class="btn-primary flex-1" id="${p('save')}"></button>
+          ${editing ? html`<button type="button" class="btn-secondary" data-act="cancel">Cancel</button>` : ''}
+        </div>
+      </div>
+    </form>`);
+
+  const el = (name) => root.querySelector(`#${p(name)}`);
+  const form = root.querySelector('form');
+  const amountEl = el('amount');
+  const dateEl = el('date');
+  const noteEl = el('note');
+  const gridEl = el('grid');
+  const chipsEl = el('chips');
+  const errorEl = el('error');
+  const categories = () => store.getCategories();
+  const visible = () => schema.visibleMains(categories(), st.type, editing ? { mainId: st.mainId, subId: st.subId } : {});
+
+  if (tx) {
+    amountEl.value = money.minorToDecimalString(tx.amount, money.decimalsFor(tx.currency));
+    noteEl.value = tx.note;
+  }
+
+  function drawAmount() {
+    const info = money.currencyInfo(currencyCode());
+    el('symbol').textContent = info.symbol;
+    amountEl.inputMode = info.decimals === 0 ? 'numeric' : 'decimal';
+    amountEl.classList.toggle('privacy-mask', privacyOn());
+    updateHint();
+  }
+
+  function updateHint() {
+    const parsed = money.parseAmount(amountEl.value, money.decimalsFor(currencyCode()));
+    el('hint').textContent = !privacyOn() && parsed.minor ? money.formatMoney(parsed.minor, currencyCode()) : '';
+  }
+
+  function drawGrid() {
+    const mains = visible();
+    if (st.mainId && !mains.some((m) => m.id === st.mainId)) { st.mainId = null; st.subId = null; }
+    put(gridEl, mains.length ? html`${mains.map((m) => html`
+      <label class="tile" style="--cat: ${m.color}">
+        <input type="radio" class="sr-only" name="${p('cat')}" value="${m.id}" ${st.mainId === m.id ? 'checked' : ''}>
+        <span class="tile-face"><span class="tile-emoji" aria-hidden="true">${m.emoji}</span><span class="tile-name">${m.name}${m.hidden ? ' (hidden)' : ''}</span></span>
+      </label>`)}` : html`<p class="col-span-full text-sm muted">Every category is switched off. Turn some on in Settings.</p>`);
+  }
+
+  function drawChips() {
+    const main = visible().find((m) => m.id === st.mainId);
+    if (main && st.subId && !main.subs.some((s) => s.id === st.subId)) st.subId = null;
+    el('subs').hidden = !main || main.subs.length === 0;
+    put(chipsEl, html`${(main?.subs ?? []).map((s) => html`
+      <label class="chip" style="--cat: ${s.color || main.color}">
+        <input type="radio" class="sr-only" name="${p('sub')}" value="${s.id}" ${st.subId === s.id ? 'checked' : ''}>
+        <span class="chip-face">${s.emoji ? html`<span aria-hidden="true">${s.emoji}</span>` : ''}${s.name}${s.hidden ? ' (hidden)' : ''}</span>
+      </label>`)}`);
+  }
+
+  function drawNote() {
+    const required = schema.noteRequired(categories(), st.mainId, st.subId);
+    if (required) st.showNote = true;
+    el('note-field').hidden = !st.showNote;
+    el('note-toggle').hidden = st.showNote;
+    noteEl.required = required;
+    noteEl.setAttribute('aria-required', String(required));
+    el('note-label').textContent = required ? 'Note (required for this category)' : 'Note (optional)';
+  }
+
+  function drawDate() {
+    el('date-label').textContent = fullDateLabel(st.date);
+    dateEl.value = st.date;
+    el('date-field').hidden = !st.showDate;
+    el('date-row').hidden = editing;
+    el('date-toggle').hidden = st.showDate;
+  }
+
+  function drawSave() {
+    el('save').textContent = editing ? 'Save changes' : `Save ${st.type}`;
+  }
+
+  function drawAll() { drawAmount(); drawGrid(); drawChips(); drawNote(); drawDate(); drawSave(); }
+
+  function clearError() {
+    errorEl.textContent = '';
+    for (const field of [amountEl, dateEl, noteEl]) field.removeAttribute('aria-invalid');
+  }
+
+  function fail(message, field = null) {
+    errorEl.textContent = message;
+    if (field) { field.setAttribute('aria-invalid', 'true'); field.focus(); }
+  }
+
+  function submit() {
+    clearError();
+    const code = currencyCode();
+    const decimals = money.decimalsFor(code);
+    const parsed = money.parseAmount(amountEl.value, decimals);
+    if (parsed.error) return fail(amountMessage(parsed.error, code, decimals), amountEl);
+    if (!st.mainId) return fail('Choose a category.', gridEl.querySelector('input'));
+    if (!st.date) { st.showDate = true; drawDate(); return fail('Choose a valid date.', dateEl); }
+    const note = noteEl.value.trim();
+    if (schema.noteRequired(categories(), st.mainId, st.subId) && !note) {
+      return fail('Please add a note: "Other (Specify)" needs a description.', noteEl);
+    }
+    try {
+      onSubmit({ type: st.type, amount: parsed.minor, categoryId: st.mainId, subCategoryId: st.subId, date: st.date, note });
+    } catch (err) {
+      if (!isFriendly(err)) throw err;
+      return fail(err.message);
+    }
+    if (!editing) reset();
+    return undefined;
+  }
+
+  /** Clear the form back to its defaults and put the cursor in Amount, ready for the next one. */
+  function reset() {
+    Object.assign(st, { type: 'expense', mainId: null, subId: null, date: todayStr(), showDate: false, showNote: false });
+    amountEl.value = '';
+    noteEl.value = '';
+    form.querySelector(`input[name="${p('type')}"][value="expense"]`).checked = true;
+    clearError();
+    drawAll();
+    amountEl.focus();
+  }
+
+  form.addEventListener('change', (e) => {
+    const { name, value } = e.target;
+    if (name === p('type')) { st.type = value; st.mainId = null; st.subId = null; drawGrid(); drawChips(); drawNote(); drawSave(); }
+    else if (name === p('cat')) { st.mainId = value; st.subId = null; drawChips(); drawNote(); }
+    else if (name === p('sub')) { st.subId = value; drawNote(); }
+    else if (e.target === dateEl) { st.date = value; drawDate(); }
+    clearError();
+  });
+  form.addEventListener('input', (e) => { if (e.target === amountEl) { updateHint(); clearError(); } });
+  form.addEventListener('click', (e) => {
+    const act = e.target.closest('[data-act]')?.dataset.act;
+    if (act === 'toggle-date') { st.showDate = true; drawDate(); dateEl.focus(); }
+    else if (act === 'toggle-note') { st.showNote = true; drawNote(); noteEl.focus(); }
+    else if (act === 'cancel') onCancel?.();
+  });
+  form.addEventListener('submit', (e) => { e.preventDefault(); submit(); });
+
+  drawAll();
+  return {
+    /** Re-read categories, currency and privacy mode without touching what the person typed. */
+    refresh: drawAll,
+    focusAmount: () => {
+      // If Amount is already the active element (e.g. a closing dialog just "restored" focus to it),
+      // Chrome can leave it unable to take text until it is genuinely re-focused.
+      if (document.activeElement === amountEl) amountEl.blur();
+      amountEl.focus();
+      if (editing) amountEl.select();
+    },
+  };
+}
+
+function editTransaction(id) {
+  const tx = store.getTransactions().find((t) => t.id === id && !t.deleted);
+  if (!tx) return;
+  const { dlg } = mountDialog(html`
+    <div class="p-5">
+      <h2 id="dlg-title" class="mb-4 text-lg font-semibold">Edit transaction</h2>
+      <div id="edit-root"></div>
+    </div>`);
+  const form = createTxForm($('#edit-root', dlg), {
+    prefix: 'edit',
+    mode: 'edit',
+    tx,
+    onSubmit: (payload) => {
+      store.updateTransaction(id, payload);
+      dlg.close('saved');
+      toast('Transaction updated');
+    },
+    onCancel: () => dlg.close(''),
+  });
+  form.focusAmount();
+}
+
+/* ================================================================== */
+/* Month view                                                          */
+/* ================================================================== */
+
+function tileHtml(label, minor, { note = '', wide = false } = {}) {
+  return html`
+    <div class="card ${wide ? 'col-span-2' : ''}">
+      <dt class="text-sm font-medium muted">${label}${note ? html` <span class="font-normal">${note}</span>` : ''}</dt>
+      <dd class="${wide ? 'text-3xl' : 'text-xl'} mt-1 break-words font-semibold tabular-nums">${amountHtml(minor)}</dd>
+    </div>`;
+}
+
+function rowHtml(t, cats) {
+  const label = schema.labelFor(cats, t.categoryId, t.subCategoryId);
+  const title = label.sub ? `${label.main} › ${label.sub}` : label.main;
+  const bucket = schema.bucketOf(cats, t);
+  const tone = { income: 'text-emerald-700 dark:text-emerald-400', savings: 'text-sky-700 dark:text-sky-400', spending: '' }[bucket];
+  return html`
+    <li class="grid grid-cols-[auto_1fr_auto] items-center gap-x-3 gap-y-0 px-3 py-2 sm:grid-cols-[auto_1fr_auto_auto]">
+      <span class="dot" style="--cat: ${label.color}" aria-hidden="true">${label.subEmoji || label.emoji}</span>
+      <div class="min-w-0">
+        <p class="line-clamp-2 break-words font-medium">${title}</p>
+        ${t.note ? html`<p class="line-clamp-2 break-words text-sm muted">${t.note}</p>` : ''}
+      </div>
+      <p class="text-right font-semibold tabular-nums ${tone}">${amountHtml(t.amount, t.type === 'income' ? '+' : '−')}</p>
+      <div class="col-span-3 flex justify-end sm:col-span-1">
+        <button type="button" class="icon-btn" data-act="edit-tx" data-id="${t.id}" data-key="edit:${t.id}" aria-label="Edit ${title}, ${dayLabel(t.date)}">${icon('pencil')}</button>
+        <button type="button" class="icon-btn" data-act="delete-tx" data-id="${t.id}" data-key="del:${t.id}" aria-label="Delete ${title}, ${dayLabel(t.date)}">${icon('trash')}</button>
+      </div>
+    </li>`;
+}
+
+function monthHtml() {
+  const { categories: cats, transactions } = store.getState();
+  const live = transactions.filter((t) => !t.deleted);
+  const months = [...live.map((t) => monthOf(t.date)), monthOf(todayStr()), ui.month].sort();
+  const [first, last] = [months[0], months.at(-1)];
+
+  const inMonth = live.filter((t) => monthOf(t.date) === ui.month);
+  const totals = schema.summarize(inMonth, cats);
+
+  const mainChoices = cats.filter((m) => ui.filterType === 'all' || m.type === ui.filterType);
+  if (ui.filterMain !== 'all' && !mainChoices.some((m) => m.id === ui.filterMain)) ui.filterMain = 'all';
+  const shown = inMonth
+    .filter((t) => (ui.filterType === 'all' || t.type === ui.filterType) && (ui.filterMain === 'all' || t.categoryId === ui.filterMain))
+    .sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt));
+  const days = [];
+  for (const t of shown) {
+    if (days.at(-1)?.date !== t.date) days.push({ date: t.date, items: [] });
+    days.at(-1).items.push(t);
+  }
+  const option = (m) => html`<option value="${m.id}" ${ui.filterMain === m.id ? 'selected' : ''}>${m.emoji} ${m.name}${m.enabled ? '' : ' (hidden)'}</option>`;
+  const filtered = ui.filterType !== 'all' || ui.filterMain !== 'all';
+
+  return html`
+    <div class="space-y-4">
+      <div class="flex items-center justify-between">
+        <button type="button" class="icon-btn" data-act="prev-month" data-key="prev" aria-label="Previous month" ${ui.month <= first ? 'disabled' : ''}>${icon('left')}</button>
+        <h2 id="h-month" tabindex="-1" class="text-lg font-semibold" aria-live="polite">${fmtMonth.format(dateFromStr(`${ui.month}-01`))}</h2>
+        <button type="button" class="icon-btn" data-act="next-month" data-key="next" aria-label="Next month" ${ui.month >= last ? 'disabled' : ''}>${icon('right')}</button>
+      </div>
+
+      <dl class="grid grid-cols-2 gap-3">
+        ${tileHtml('Income', totals.income)}
+        ${tileHtml('Expenses', totals.spending, { note: 'excl. savings' })}
+        ${tileHtml('Savings & investments', totals.savings)}
+        ${tileHtml('Net balance', totals.net)}
+      </dl>
+
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="field-label" for="f-type">Type</label>
+          <select id="f-type" class="input" data-filter="type" data-key="f-type">
+            <option value="all" ${ui.filterType === 'all' ? 'selected' : ''}>All types</option>
+            <option value="income" ${ui.filterType === 'income' ? 'selected' : ''}>Income</option>
+            <option value="expense" ${ui.filterType === 'expense' ? 'selected' : ''}>Expenses</option>
+          </select>
+        </div>
+        <div>
+          <label class="field-label" for="f-main">Category</label>
+          <select id="f-main" class="input" data-filter="main" data-key="f-main">
+            <option value="all">All categories</option>
+            ${ui.filterType === 'all'
+              ? ['income', 'expense'].map((type) => html`<optgroup label="${type === 'income' ? 'Income' : 'Expenses'}">${cats.filter((m) => m.type === type).map(option)}</optgroup>`)
+              : mainChoices.map(option)}
+          </select>
+        </div>
+      </div>
+      ${filtered ? html`<p class="text-sm muted" aria-live="polite">Showing ${shown.length} of ${plural(inMonth.length, 'transaction')}. Totals above cover the whole month.</p>` : ''}
+
+      ${days.length ? html`<div class="space-y-4">${days.map((day) => html`
+        <section aria-label="${dayLabel(day.date)}">
+          <h3 class="mb-1 px-1 text-sm font-semibold muted">${dayLabel(day.date)}</h3>
+          <ul class="divide-y divide-slate-200 overflow-hidden rounded-2xl border border-slate-200 bg-white dark:divide-slate-800 dark:border-slate-800 dark:bg-slate-900">
+            ${day.items.map((t) => rowHtml(t, cats))}
+          </ul>
+        </section>`)}</div>`
+      : html`<p class="card text-center muted">${inMonth.length ? 'Nothing matches these filters.' : 'Nothing logged this month yet.'}</p>`}
+    </div>`;
+}
+
+function renderMonth() {
+  const root = $('#view-month');
+  withFocus(root, () => put(root, monthHtml()));
+}
+
+function wireMonth() {
+  const root = $('#view-month');
+  root.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-act]');
+    if (!btn || btn.disabled) return;
+    const { act, id } = btn.dataset;
+    if (act === 'prev-month') { ui.month = shiftMonth(ui.month, -1); renderMonth(); }
+    else if (act === 'next-month') { ui.month = shiftMonth(ui.month, 1); renderMonth(); }
+    else if (act === 'edit-tx') editTransaction(id);
+    else if (act === 'delete-tx') {
+      guard(() => store.deleteTransaction(id));
+      toast('Transaction deleted', { action: 'Undo', onAction: () => guard(() => store.restoreTransaction(id)) });
+    }
+  });
+  root.addEventListener('change', (e) => {
+    const which = e.target.dataset.filter;
+    if (which === 'type') { ui.filterType = e.target.value; renderMonth(); }
+    else if (which === 'main') { ui.filterMain = e.target.value; renderMonth(); }
+  });
+}
+
+/* ================================================================== */
+/* Currency                                                            */
+/* ================================================================== */
+
+/** Searchable ISO 4217 picker. Resolves with the chosen code, or null if cancelled. */
+async function pickCurrency({ current, first = false }) {
+  const list = money.listCurrencies();
+  let selected = current;
+  const { dlg, done } = mountDialog(html`
+    <div class="space-y-4 p-5">
+      <h2 id="dlg-title" class="text-lg font-semibold">${first ? 'Choose your currency' : 'Change currency'}</h2>
+      ${first ? html`<p class="muted">S.E.L.F keeps everything on this device. Pick the currency you spend in. You can change it later in Settings.</p>` : ''}
+      <div>
+        <label class="field-label" for="cur-search">Search by code or name</label>
+        <input id="cur-search" type="search" class="input" autocomplete="off" placeholder="UGX, shilling, dollar…" autofocus>
+      </div>
+      <div id="cur-list" role="radiogroup" aria-label="Currencies" class="max-h-64 overflow-y-auto rounded-xl border border-slate-300 p-1 dark:border-slate-700"></div>
+      <div class="flex flex-wrap justify-end gap-2">
+        ${first ? '' : html`<button type="button" class="btn-secondary" data-close="">Cancel</button>`}
+        <button type="button" class="btn-primary" id="cur-ok" data-close="ok"></button>
+      </div>
+    </div>`, { dismissible: !first });
+
+  const listEl = $('#cur-list', dlg);
+  const okEl = $('#cur-ok', dlg);
+  const searchEl = $('#cur-search', dlg);
+  const drawOk = () => { okEl.textContent = first ? `Continue with ${selected}` : `Use ${selected}`; };
+  const matches = () => money.searchCurrencies(list, searchEl.value);
+
+  function drawList() {
+    const rows = matches();
+    put(listEl, rows.length ? html`${rows.map((c) => html`
+      <label class="cur-row">
+        <input type="radio" class="sr-only" name="cur" value="${c.code}" ${c.code === selected ? 'checked' : ''}>
+        <span class="cur-face"><span><strong>${c.code}</strong> <span class="muted">${c.name}</span></span><span class="whitespace-nowrap text-sm muted">${c.symbol} · ${c.decimals} dp</span></span>
+      </label>`)}` : html`<p class="p-3 text-sm muted">No currency matches that search.</p>`);
+  }
+
+  searchEl.addEventListener('input', drawList);
+  searchEl.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    const rows = matches();
+    if (searchEl.value.trim() && rows.length) selected = rows[0].code;
+    dlg.close('ok');
+  });
+  listEl.addEventListener('change', (e) => { selected = e.target.value; drawOk(); });
+  drawList();
+  drawOk();
+  listEl.querySelector('input:checked')?.closest('label').scrollIntoView({ block: 'center' });
+
+  return (await done) === 'ok' ? selected : null;
+}
+
+/** The mandatory warning before relabelling existing amounts. → 'relabel' | 'backup' | '' */
+async function currencyWarning(from, to, info) {
+  const before = money.currencyInfo(from);
+  const after = money.currencyInfo(to);
+  const example = privacyOn() ? '' : html`
+    <p class="text-sm">For example, ${money.formatMoney(50000 * 10 ** before.decimals, from)} becomes ${money.formatMoney(50000 * 10 ** after.decimals, to)}.</p>`;
+  const { done } = mountDialog(html`
+    <div class="space-y-4 p-5">
+      <h2 id="dlg-title" class="text-lg font-semibold">Change currency to ${to}?</h2>
+      <div class="space-y-2 rounded-xl border border-amber-300 bg-amber-50 p-3 text-amber-950 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100">
+        <p class="font-semibold">Existing amounts will NOT be converted. They will be relabelled in the new currency.</p>
+        <p class="text-sm">${from} has ${plural(before.decimals, 'decimal place')} and ${to} has ${after.decimals}, so values are adjusted to keep the same number: 50,000 stays 50,000, not 500.00.</p>
+        ${example}
+        ${info.rounded ? html`<p class="text-sm">${plural(info.rounded, 'transaction')} include${info.rounded === 1 ? 's' : ''} fractions that ${to} can't show and will be rounded to the nearest whole unit.</p>` : ''}
+      </div>
+      <p class="muted text-sm">${plural(info.count, 'transaction')} will be relabelled.</p>
+      <div class="flex flex-col gap-2 sm:flex-row-reverse">
+        <button type="button" class="btn-primary flex-1" data-close="relabel">Relabel only</button>
+        <button type="button" class="btn-secondary flex-1" data-close="backup" autofocus>Cancel and export a backup first</button>
+      </div>
+    </div>`);
+  return done;
+}
+
+async function changeCurrencyFlow() {
+  const current = currencyCode();
+  const code = await pickCurrency({ current });
+  if (!code || code === current) return;
+  const info = store.previewCurrencyChange(code);
+  if (info.count === 0) {
+    guard(() => store.changeCurrency(code));
+    toast(`Currency set to ${code}`);
+    return;
+  }
+  const choice = await currencyWarning(current, code, info);
+  if (choice === 'relabel') {
+    if (guard(() => { store.changeCurrency(code); return true; })) toast(`Relabelled ${plural(info.count, 'transaction')} as ${code}`);
+  } else if (choice === 'backup') {
+    exportJson();
+    toast(`Backup downloaded. Your currency is still ${current}.`);
+  }
+}
+
+/* ================================================================== */
+/* Settings                                                            */
+/* ================================================================== */
+
+const switchHtml = ({ on, label, act, id = '', key }) => html`
+  <button type="button" role="switch" class="switch" aria-checked="${String(on)}" aria-label="${label}"
+          data-act="${act}" data-id="${id}" data-key="${key}"><span class="switch-track"><span class="switch-knob"></span></span></button>`;
+
+function itemButtons(cats, item, used, isSub) {
+  const pos = schema.positionOf(cats, item.id);
+  const inUse = used.has(item.id) || (!isSub && item.subs.some((s) => used.has(s.id)));
+  return html`
+    <button type="button" class="icon-btn" data-act="move" data-dir="-1" data-id="${item.id}" data-key="up:${item.id}" aria-label="Move ${item.name} up" ${pos.index === 0 ? 'disabled' : ''}>${icon('up')}</button>
+    <button type="button" class="icon-btn" data-act="move" data-dir="1" data-id="${item.id}" data-key="down:${item.id}" aria-label="Move ${item.name} down" ${pos.index === pos.count - 1 ? 'disabled' : ''}>${icon('down')}</button>
+    <button type="button" class="icon-btn" data-act="rename" data-id="${item.id}" data-key="ren:${item.id}" aria-label="Rename or restyle ${item.name}">${icon('pencil')}</button>
+    ${item.custom ? html`<button type="button" class="icon-btn ${inUse ? 'opacity-40' : ''}" data-act="delete-item" data-id="${item.id}" data-key="rm:${item.id}" aria-label="Delete ${item.name}${inUse ? ' (has transactions, hide it instead)' : ''}">${icon('trash')}</button>` : ''}`;
+}
+
+function mainCardHtml(cats, main, used) {
+  const open = ui.openMains.has(main.id);
+  return html`
+    <li class="rounded-xl border border-slate-200 dark:border-slate-700">
+      <div class="flex items-center gap-1 pl-1">
+        <button type="button" class="flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded-lg px-2 text-left" data-act="toggle-open" data-id="${main.id}" data-key="open:${main.id}" aria-expanded="${String(open)}">
+          <span class="${open ? 'rotate-90' : ''} transition-transform" aria-hidden="true">${icon('right', 18)}</span>
+          <span class="dot" style="--cat: ${main.color}" aria-hidden="true">${main.emoji}</span>
+          <span class="min-w-0 truncate font-medium ${main.enabled ? '' : 'muted line-through'}">${main.name}</span>
+          <span class="shrink-0 text-xs muted">${plural(main.subs.length, 'item')}</span>
+        </button>
+        ${switchHtml({ on: main.enabled, label: `Show ${main.name} in the entry form`, act: 'toggle-item', id: main.id, key: `tog:${main.id}` })}
+      </div>
+      ${open ? html`
+        <div class="border-t border-slate-200 px-2 pb-2 dark:border-slate-700">
+          <div class="flex flex-wrap items-center gap-1 py-1">
+            <span class="mr-auto pl-1 text-sm muted">${main.name}${main.custom ? ' · custom' : ''}${main.isSavings ? ' · counted as savings' : ''}</span>
+            ${itemButtons(cats, main, used, false)}
+          </div>
+          <ul class="space-y-1">
+            ${main.subs.map((sub) => html`
+              <li class="flex flex-wrap items-center gap-1 rounded-lg bg-slate-100 pl-3 dark:bg-slate-800">
+                <span class="flex min-h-11 min-w-[7rem] flex-1 items-center gap-2 ${sub.enabled ? '' : 'muted line-through'}">
+                  ${sub.emoji ? html`<span aria-hidden="true">${sub.emoji}</span>` : ''}<span>${sub.name}</span>
+                  ${sub.requiresNote ? html`<span class="text-xs muted">note required</span>` : ''}${sub.custom ? html`<span class="text-xs muted">custom</span>` : ''}
+                </span>
+                ${switchHtml({ on: sub.enabled, label: `Show ${sub.name} in the entry form`, act: 'toggle-item', id: sub.id, key: `tog:${sub.id}` })}
+                ${itemButtons(cats, sub, used, true)}
+              </li>`)}
+          </ul>
+          <button type="button" class="btn-link mt-1" data-act="add-field" data-type="${main.type}" data-parent="${main.id}" data-key="addsub:${main.id}">+ Add sub-category to ${main.name}</button>
+        </div>` : ''}
+    </li>`;
+}
+
+function settingsHtml() {
+  const { settings, categories: cats, transactions } = store.getState();
+  const cur = money.currencyInfo(settings.currency);
+  const used = schema.usedCategoryIds(transactions);
+  const mains = cats.filter((m) => m.type === ui.settingsType);
+  const live = transactions.filter((t) => !t.deleted).length;
+  const kb = Math.max(1, Math.round(store.approxBytes() / 1024));
+
+  return html`
+    <div class="space-y-4">
+      <h2 id="h-settings" tabindex="-1" class="text-lg font-semibold">Settings</h2>
+
+      <section class="card" aria-labelledby="s-currency">
+        <h3 id="s-currency" class="card-title">Currency</h3>
+        <p><strong>${cur.code}</strong> <span class="muted">${cur.name}</span></p>
+        <p class="text-sm muted">Symbol ${cur.symbol} · ${plural(cur.decimals, 'decimal place')}. Set automatically from the code.</p>
+        <button type="button" class="btn-secondary mt-3" data-act="change-currency" data-key="change-currency">Change currency</button>
+      </section>
+
+      <section class="card space-y-3" aria-labelledby="s-look">
+        <h3 id="s-look" class="card-title">Privacy and appearance</h3>
+        <div class="flex items-center justify-between gap-3">
+          <div><p class="font-medium">Privacy mode</p><p class="text-sm muted">Hides every amount on every screen.</p></div>
+          ${switchHtml({ on: settings.privacyMode, label: 'Privacy mode', act: 'toggle-privacy', key: 'privacy-switch' })}
+        </div>
+        <fieldset>
+          <legend class="field-label">Theme</legend>
+          <div class="seg-wrap !grid-cols-3" role="radiogroup">
+            ${['system', 'light', 'dark'].map((t) => html`
+              <label class="seg"><input type="radio" class="sr-only" name="theme" value="${t}" data-setting="theme" data-key="theme:${t}" ${settings.theme === t ? 'checked' : ''}><span class="seg-face">${t[0].toUpperCase()}${t.slice(1)}</span></label>`)}
+          </div>
+        </fieldset>
+      </section>
+
+      <section class="card" aria-labelledby="s-cats">
+        <h3 id="s-cats" class="card-title">Categories</h3>
+        <p class="mb-3 text-sm muted">Switch a category off to hide it from the entry form. Past transactions keep their label. Built-in categories can be hidden but not deleted.</p>
+        <div class="seg-wrap mb-3" role="radiogroup" aria-label="Category type">
+          ${['expense', 'income'].map((t) => html`
+            <label class="seg"><input type="radio" class="sr-only" name="cat-type" value="${t}" data-setting="cat-type" data-key="cat-type:${t}" ${ui.settingsType === t ? 'checked' : ''}><span class="seg-face">${t === 'expense' ? 'Expenses' : 'Income'}</span></label>`)}
+        </div>
+        <ul class="space-y-2">${mains.map((m) => mainCardHtml(cats, m, used))}</ul>
+        <div class="mt-4 flex flex-wrap gap-2">
+          <button type="button" class="btn-secondary" data-act="add-field" data-type="${ui.settingsType}" data-key="add-field">+ Add custom field</button>
+          <button type="button" class="btn-danger" data-act="reset-cats" data-key="reset-cats">Reset to defaults</button>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="s-backup">
+        <h3 id="s-backup" class="card-title">Backup</h3>
+        <p class="mb-3 text-sm muted">Your data lives only in this browser. Export a backup now and then, especially before clearing browser data or switching devices.</p>
+        <div class="flex flex-wrap gap-2">
+          <button type="button" class="btn-secondary" data-act="export-json" data-key="export-json">Export JSON (full backup)</button>
+          <button type="button" class="btn-secondary" data-act="export-csv" data-key="export-csv">Export CSV</button>
+          <button type="button" class="btn-secondary" data-act="import" data-key="import">Import JSON…</button>
+        </div>
+        <p class="mt-3 text-sm muted">${plural(live, 'transaction')} on this device · about ${kb} KB used of roughly 5 MB.</p>
+      </section>
+    </div>`;
+}
+
+function renderSettings() {
+  const root = $('#view-settings');
+  withFocus(root, () => put(root, settingsHtml()));
+}
+
+function swatchesHtml(name, current) {
+  const options = [{ name: 'Automatic', hex: '' }, ...schema.COLOR_CHOICES];
+  if (current && !options.some((c) => c.hex === current)) options.splice(1, 0, { name: 'Current colour', hex: current });
+  return html`${options.map((c) => html`
+    <label class="swatch">
+      <input type="radio" class="sr-only" name="${name}" value="${c.hex}" ${c.hex === current ? 'checked' : ''}>
+      <span class="swatch-dot ${c.hex ? '' : 'swatch-none'}" ${c.hex ? html`style="--sw: ${c.hex}"` : ''}></span>
+      <span class="sr-only">${c.name}</span>
+    </label>`)}`;
+}
+
+/** Dialog for "Add custom field" (sub-category or main category) and for rename/restyle. */
+async function itemDialog({ item = null, type = 'expense', parentId = '' }) {
+  const editing = Boolean(item);
+  const cats = store.getCategories();
+  let kind = type;
+  const { dlg, done } = mountDialog(html`
+    <form class="space-y-4 p-5" novalidate autocomplete="off">
+      <h2 id="dlg-title" class="text-lg font-semibold">${editing ? `Rename or restyle "${item.name}"` : 'Add custom field'}</h2>
+      ${editing ? '' : html`
+        <fieldset>
+          <legend class="field-label">Type</legend>
+          <div class="seg-wrap">
+            ${['expense', 'income'].map((t) => html`<label class="seg"><input type="radio" class="sr-only" name="af-type" value="${t}" ${t === kind ? 'checked' : ''}><span class="seg-face">${t === 'expense' ? 'Expense' : 'Income'}</span></label>`)}
+          </div>
+        </fieldset>
+        <div><label class="field-label" for="af-parent">Parent category</label><select id="af-parent" class="input"></select></div>`}
+      <div>
+        <label class="field-label" for="af-name">Name</label>
+        <input id="af-name" class="input" maxlength="40" required autofocus value="${editing ? item.name : ''}">
+      </div>
+      <div>
+        <label class="field-label" for="af-emoji">Emoji <span class="font-normal muted">(optional)</span></label>
+        <input id="af-emoji" class="input" maxlength="16" placeholder="e.g. 🌽" value="${editing ? item.emoji : ''}">
+      </div>
+      <fieldset>
+        <legend class="field-label">Colour <span class="font-normal muted">(optional)</span></legend>
+        <div class="flex flex-wrap">${swatchesHtml('af-color', editing ? item.color : '')}</div>
+      </fieldset>
+      <p id="af-error" role="alert" class="min-h-5 text-sm font-medium text-rose-700 dark:text-rose-300"></p>
+      <div class="flex justify-end gap-2">
+        <button type="button" class="btn-secondary" data-close="">Cancel</button>
+        <button type="submit" class="btn-primary">${editing ? 'Save' : 'Add'}</button>
+      </div>
+    </form>`);
+
+  const parentEl = $('#af-parent', dlg);
+  const errorEl = $('#af-error', dlg);
+  if (!editing) {
+    const drawParents = (selected) => {
+      put(parentEl, html`
+        ${cats.filter((m) => m.type === kind).map((m) => html`<option value="${m.id}" ${m.id === selected ? 'selected' : ''}>${m.emoji} ${m.name}${m.enabled ? '' : ' (hidden)'}</option>`)}
+        <option value="__new">＋ New main category…</option>`);
+    };
+    drawParents(parentId);
+    dlg.addEventListener('change', (e) => {
+      if (e.target.name === 'af-type') { kind = e.target.value; drawParents(''); }
+    });
+  }
+
+  $('form', dlg).addEventListener('submit', (e) => {
+    e.preventDefault();
+    const values = {
+      name: $('#af-name', dlg).value,
+      emoji: $('#af-emoji', dlg).value,
+      color: dlg.querySelector('input[name="af-color"]:checked')?.value ?? '',
+    };
+    try {
+      let next;
+      if (editing) {
+        next = schema.updateItem(cats, item.id, values);
+      } else if (parentEl.value === '__new') {
+        next = schema.addMain(cats, { type: kind, ...values });
+        const created = next.find((m) => !cats.some((c) => c.id === m.id));
+        ui.openMains.add(created.id);
+      } else {
+        next = schema.addSub(cats, parentEl.value, values);
+        ui.openMains.add(parentEl.value);
+      }
+      store.saveCategories(next);
+      if (!editing) ui.settingsType = kind;
+    } catch (err) {
+      if (!isFriendly(err)) throw err;
+      errorEl.textContent = err.message;
+      $('#af-name', dlg).focus();
+      return;
+    }
+    dlg.close('saved');
+    toast(editing ? 'Saved' : `Added "${values.name.trim()}". It's in the entry form now.`);
+  });
+
+  await done;
+}
+
+function wireSettings() {
+  const root = $('#view-settings');
+
+  root.addEventListener('change', (e) => {
+    const setting = e.target.dataset.setting;
+    if (setting === 'theme') guard(() => store.updateSettings({ theme: e.target.value }));
+    else if (setting === 'cat-type') { ui.settingsType = e.target.value; renderSettings(); }
+  });
+
+  root.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-act]');
+    if (!btn) return;
+    const { act, id } = btn.dataset;
+    const cats = store.getCategories();
+
+    switch (act) {
+      case 'change-currency': await changeCurrencyFlow(); break;
+      case 'toggle-privacy': guard(() => store.updateSettings({ privacyMode: !privacyOn() })); break;
+      case 'toggle-open':
+        if (ui.openMains.has(id)) ui.openMains.delete(id); else ui.openMains.add(id);
+        renderSettings();
+        break;
+      case 'toggle-item': {
+        const on = btn.getAttribute('aria-checked') === 'true';
+        guard(() => store.saveCategories(schema.updateItem(cats, id, { enabled: !on })));
+        break;
+      }
+      case 'move': guard(() => store.saveCategories(schema.moveItem(cats, id, Number(btn.dataset.dir)))); break;
+      case 'rename': {
+        const main = schema.findMain(cats, id);
+        const sub = main ? null : cats.flatMap((m) => m.subs).find((s) => s.id === id);
+        await itemDialog({ item: main ?? sub });
+        break;
+      }
+      case 'delete-item': {
+        const item = schema.findMain(cats, id) ?? cats.flatMap((m) => m.subs).find((s) => s.id === id);
+        const used = schema.usedCategoryIds(store.getTransactions());
+        try { schema.removeItem(cats, id, used); } catch (err) { // check the rules first so the message is specific
+          if (!isFriendly(err)) throw err;
+          toast(err.message);
+          break;
+        }
+        if (await confirmDialog({ title: `Delete "${item.name}"?`, message: 'No transaction uses it, so it can be removed for good. This can\'t be undone.', confirmLabel: 'Delete', danger: true })) {
+          guard(() => store.saveCategories(schema.removeItem(store.getCategories(), id, schema.usedCategoryIds(store.getTransactions()))));
+        }
+        break;
+      }
+      case 'add-field': await itemDialog({ type: btn.dataset.type, parentId: btn.dataset.parent ?? '' }); break;
+      case 'reset-cats':
+        if (await confirmDialog({
+          title: 'Reset categories to defaults?',
+          message: 'Names, order and on/off switches go back to the built-in list, and custom categories nobody uses are removed. Custom categories that transactions still use are kept but switched off. Your transactions are not changed.',
+          confirmLabel: 'Reset to defaults',
+          danger: true,
+        })) {
+          guard(() => store.saveCategories(schema.resetToDefaults(store.getCategories(), schema.usedCategoryIds(store.getTransactions()))));
+          toast('Categories reset to defaults');
+        }
+        break;
+      case 'export-json': exportJson(); break;
+      case 'export-csv': exportCsv(); break;
+      case 'import': $('#import-file').click(); break;
+      default: break;
+    }
+  });
+}
+
+/* ================================================================== */
+/* Backup                                                              */
+/* ================================================================== */
+
+function exportJson() {
+  download(`self-backup-${stamp()}.json`, JSON.stringify(store.exportBackup(), null, 2), 'application/json');
+}
+
+function exportCsv() {
+  const csv = buildCsv(store.getState());
+  download(`self-transactions-${stamp()}.csv`, csv, 'text/csv;charset=utf-8');
+}
+
+const MAX_IMPORT_BYTES = 25 * 1024 * 1024;
+
+async function importFile(file) {
+  let parsed;
+  let report;
+  try {
+    if (file.size > MAX_IMPORT_BYTES) throw new store.StoreError('That file is too large to be a S.E.L.F backup.');
+    parsed = store.parseBackup(await file.text());
+    report = store.previewImport(parsed);
+  } catch (err) {
+    if (!isFriendly(err)) throw err;
+    await alertDialog('Couldn\'t import that file', err.message);
+    return;
+  }
+
+  const { done } = mountDialog(html`
+    <div class="space-y-4 p-5">
+      <h2 id="dlg-title" class="text-lg font-semibold">${plural(report.found, 'transaction')} found. Merge or replace?</h2>
+      <ul class="list-disc space-y-1 pl-5 text-sm">
+        <li><strong>${report.added}</strong> new to this device</li>
+        <li><strong>${report.updated}</strong> newer than the copy you have (would update it)</li>
+        <li><strong>${report.same}</strong> already here, unchanged</li>
+        ${report.removed ? html`<li>${plural(report.removed, 'deleted record')} included (kept so nothing is lost)</li>` : ''}
+        <li>Currency in the backup: <strong>${report.currency}</strong> · ${plural(report.customCategories, 'custom category', 'custom categories')}</li>
+        ${report.exportedAt ? html`<li>Exported ${fmtStamp.format(new Date(report.exportedAt))}</li>` : ''}
+      </ul>
+      ${report.skipped ? html`<p class="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100">${plural(report.skipped, 'record')} in the file ${report.skipped === 1 ? 'is' : 'are'} invalid and will be skipped.</p>` : ''}
+      <p class="text-sm muted"><strong>Merge</strong> keeps what is here and adds or updates by ID; the newer edit wins. <strong>Replace</strong> makes this device exactly match the backup. It has ${plural(report.localCount, 'transaction')} now.</p>
+      ${report.mergeBlocked ? html`<p class="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100">This backup is in ${report.currency} but this device uses ${report.localCurrency}. Merging would mix currencies, so only Replace is available.</p>` : ''}
+      <div class="flex flex-wrap justify-end gap-2">
+        <button type="button" class="btn-secondary" data-close="" autofocus>Cancel</button>
+        <button type="button" class="btn-danger" data-close="replace">Replace</button>
+        <button type="button" class="btn-primary" data-close="merge" ${report.mergeBlocked ? 'disabled' : ''}>Merge</button>
+      </div>
+    </div>`);
+  const mode = await done;
+  if (!mode) return;
+
+  if (mode === 'replace' && report.localCount > 0) {
+    const sure = await confirmDialog({
+      title: 'Replace everything on this device?',
+      message: `Your ${plural(report.localCount, 'current transaction')} will be removed and replaced by the backup. Export a backup first if you are unsure.`,
+      confirmLabel: 'Replace everything',
+      danger: true,
+    });
+    if (!sure) return;
+  }
+  const ok = guard(() => { store.applyImport(parsed, mode); return true; });
+  if (!ok) return;
+  ui.filterType = 'all';
+  ui.filterMain = 'all';
+  toast(mode === 'merge'
+    ? `Merged: ${report.added} added, ${report.updated} updated.`
+    : `Restored ${plural(report.found, 'transaction')}.`);
+}
+
+function wireImport() {
+  const input = $('#import-file');
+  input.addEventListener('change', async () => {
+    const file = input.files?.[0];
+    input.value = ''; // so choosing the same file again still fires "change"
+    if (file) await importFile(file);
+  });
+}
+
+/* ================================================================== */
+/* Shell: theme, banner, tabs, privacy button                          */
+/* ================================================================== */
+
+const darkQuery = matchMedia('(prefers-color-scheme: dark)');
+
+function applyTheme() {
+  const pref = store.getSettings().theme;
+  document.documentElement.classList.toggle('dark', pref === 'dark' || (pref === 'system' && darkQuery.matches));
+}
+
+function renderChrome() {
+  applyTheme();
+  const on = privacyOn();
+  const btn = $('#privacy-btn');
+  btn.setAttribute('aria-pressed', String(on));
+  $('[data-icon]', btn).innerHTML = icon(on ? 'eyeOff' : 'eye').s;
+
+  const notes = [];
+  if (!bootInfo.persistent) notes.push('Your browser is blocking storage, so nothing you enter will be saved. Export a backup before closing this tab.');
+  if (bootInfo.recovered) notes.push(`The saved data couldn't be read (${bootInfo.recovered}). It was set aside in this browser under "self.data.corrupt" and the app started fresh.`);
+  put($('#banner'), html`${notes.map((n) => html`<p class="mb-4 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100" role="status">${n}</p>`)}`);
+}
+
+function renderAll() {
+  renderChrome();
+  entryForm?.refresh();
+  if (ui.tab === 'month') renderMonth();
+  if (ui.tab === 'settings') renderSettings();
+}
+
+function showTab(tab, { focus = true } = {}) {
+  ui.tab = tab;
+  for (const name of ['add', 'month', 'settings']) $(`#view-${name}`).hidden = name !== tab;
+  for (const btn of document.querySelectorAll('[data-tab]')) {
+    if (btn.dataset.tab === tab) btn.setAttribute('aria-current', 'page'); else btn.removeAttribute('aria-current');
+  }
+  if (tab === 'month') renderMonth();
+  if (tab === 'settings') renderSettings();
+  $('#toast').style.bottom = `calc(${tab === 'add' ? '9.25rem' : '5rem'} + env(safe-area-inset-bottom))`;
+  if (focus) {
+    if (tab === 'add') entryForm.focusAmount();
+    else $(`#h-${tab}`)?.focus({ preventScroll: true });
+  }
+  window.scrollTo({ top: 0 });
+}
+
+function wireShell() {
+  for (const el of document.querySelectorAll('[data-icon]')) el.innerHTML = icon(el.dataset.icon).s;
+  for (const btn of document.querySelectorAll('[data-tab]')) btn.addEventListener('click', () => showTab(btn.dataset.tab));
+  $('#privacy-btn').addEventListener('click', () => guard(() => store.updateSettings({ privacyMode: !privacyOn() })));
+  darkQuery.addEventListener('change', applyTheme);
+}
+
+/* ================================================================== */
+/* Boot                                                                */
+/* ================================================================== */
+
+function saveFromEntry(payload) {
+  const tx = store.addTransaction(payload);
+  const label = schema.labelFor(store.getCategories(), tx.categoryId, tx.subCategoryId);
+  toast(`${tx.type === 'income' ? 'Income' : 'Expense'} saved · ${label.main}${label.sub ? ` › ${label.sub}` : ''}`, {
+    action: 'Undo',
+    onAction: () => { guard(() => store.deleteTransaction(tx.id)); entryForm.focusAmount(); },
+  });
+}
+
+async function start() {
+  bootInfo = store.init();
+  wireShell();
+  entryForm = createTxForm($('#entry'), { prefix: 'add', mode: 'add', onSubmit: saveFromEntry });
+  wireMonth();
+  wireSettings();
+  wireImport();
+  showTab('add', { focus: false }); // focus comes below, after any first-run dialog has closed
+  renderChrome();
+  store.subscribe(renderAll);
+
+  // First run: pick the currency before anything can be logged.
+  if (!store.getSettings().currencyConfirmed) {
+    const code = await pickCurrency({ current: store.getSettings().currency, first: true });
+    guard(() => store.updateSettings({ currency: code, currencyConfirmed: true }));
+  }
+  entryForm.focusAmount();
+}
+
+start();

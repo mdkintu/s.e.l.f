@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="S.E.L.F is a private, local-first personal finance tracker. No account, no network calls: your data stays on your device.">
+  <!--
+    The browser itself enforces "nothing leaves the device": connect-src 'none' blocks every
+    fetch/XHR/WebSocket, and scripts may only come from this site plus the Tailwind CDN.
+    Later steps that add a network call (Step 3 model download, Step 4 Supabase) must widen
+    connect-src on purpose. If you edit either of the two inline scripts below, update its sha256 here.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://cdn.tailwindcss.com 'sha256-Vbx2Z8AVOQF7FX27OSg3OT8hvHPJZLnydcAUrQ8XFmU=' 'sha256-GlbDdvDEo5AcvJCZtLzBbddMMueNEf3d3vlDP8c214Q='; style-src 'self' 'unsafe-inline'; img-src data: blob:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>S.E.L.F</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f766e'/%3E%3Ctext x='16' y='22' font-family='sans-serif' font-size='18' font-weight='700' text-anchor='middle' fill='white'%3ES%3C/text%3E%3C/svg%3E">
+
+  <!-- Dark mode follows the system before first paint; app.js applies a saved override afterwards. -->
+  <script>document.documentElement.classList.toggle('dark', matchMedia('(prefers-color-scheme: dark)').matches)</script>
+  <!-- Tailwind via CDN, pinned. (The CDN sends no CORS headers, so Subresource Integrity can't be used.) -->
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <script>tailwind.config = { darkMode: 'class' }</script>
+
+  <style>
+    [hidden] { display: none !important; }
+    /* Anything scrolled or focused into view must clear the fixed bottom nav and the sticky save bar */
+    html { -webkit-text-size-adjust: 100%; scroll-padding-bottom: 9rem; scroll-padding-top: 1rem; }
+    :root { --ring: #0f766e; }
+    html.dark { --ring: #2dd4bf; }
+    :focus-visible { outline: 3px solid var(--ring); outline-offset: 2px; }
+    .skip { position: absolute; left: -999px; top: 0; z-index: 100; background: #0f766e; color: #fff; padding: .75rem 1rem; }
+    .skip:focus { left: 0; }
+    .privacy-mask { -webkit-text-security: disc; text-security: disc; }
+
+    /* Type toggle */
+    .seg-wrap { display: grid; grid-template-columns: 1fr 1fr; gap: .25rem; border-radius: .875rem; padding: .25rem; background: #e2e8f0; }
+    .seg-face { display: flex; min-height: 2.75rem; align-items: center; justify-content: center; border-radius: .65rem; font-weight: 600; cursor: pointer; color: #475569; }
+    .seg input:checked + .seg-face { background: #fff; color: #0f172a; box-shadow: 0 1px 2px rgb(0 0 0 / .15); }
+    .seg input:focus-visible + .seg-face { outline: 3px solid var(--ring); outline-offset: 2px; }
+    html.dark .seg-wrap { background: #1e293b; }
+    html.dark .seg-face { color: #94a3b8; }
+    html.dark .seg input:checked + .seg-face { background: #020617; color: #f1f5f9; }
+
+    /* Category tiles and sub-category chips: colour comes from each category's data via --cat */
+    .tile, .chip { --cat: #64748b; cursor: pointer; }
+    .tile { display: block; }
+    .tile-face { display: flex; min-height: 4.75rem; flex-direction: column; align-items: center; justify-content: center; gap: .2rem;
+      border-radius: .875rem; border: 2px solid color-mix(in srgb, var(--cat) 40%, transparent);
+      background: color-mix(in srgb, var(--cat) 7%, transparent); padding: .5rem .25rem; text-align: center; transition: background .12s, border-color .12s; }
+    .tile:hover .tile-face { background: color-mix(in srgb, var(--cat) 15%, transparent); }
+    .tile-emoji { font-size: 1.6rem; line-height: 1; }
+    .tile-name { font-size: .75rem; line-height: 1.15; font-weight: 600; overflow-wrap: anywhere; }
+    .chip-face { display: inline-flex; min-height: 2.75rem; align-items: center; gap: .375rem; border-radius: 9999px;
+      border: 2px solid color-mix(in srgb, var(--cat) 45%, transparent); padding: 0 1rem; font-size: .95rem; font-weight: 500; transition: background .12s; }
+    .chip:hover .chip-face { background: color-mix(in srgb, var(--cat) 12%, transparent); }
+    .tile input:checked + .tile-face { border-color: var(--cat); background: color-mix(in srgb, var(--cat) 26%, transparent); box-shadow: 0 0 0 1px var(--cat); }
+    .chip input:checked + .chip-face { border-color: var(--cat); background: color-mix(in srgb, var(--cat) 26%, transparent); font-weight: 600; }
+    .tile input:focus-visible + .tile-face, .chip input:focus-visible + .chip-face { outline: 3px solid var(--ring); outline-offset: 2px; }
+    .dot { display: inline-flex; width: 2.5rem; height: 2.5rem; flex: none; align-items: center; justify-content: center; border-radius: 9999px;
+      background: color-mix(in srgb, var(--cat, #64748b) 22%, transparent); font-size: 1.25rem; }
+
+    /* On/off switch */
+    .switch { display: inline-flex; min-width: 3.25rem; min-height: 2.75rem; align-items: center; justify-content: center; background: none; border: 0; cursor: pointer; }
+    .switch-track { position: relative; width: 2.75rem; height: 1.6rem; border-radius: 9999px; background: #64748b; transition: background .15s; }
+    .switch-knob { position: absolute; top: .2rem; left: .2rem; width: 1.2rem; height: 1.2rem; border-radius: 9999px; background: #fff; transition: transform .15s; }
+    .switch[aria-checked="true"] .switch-track { background: #0f766e; }
+    .switch[aria-checked="true"] .switch-knob { transform: translateX(1.15rem); }
+    html.dark .switch[aria-checked="true"] .switch-track { background: #0d9488; }
+
+    /* Colour swatches and currency rows */
+    .swatch { display: inline-flex; min-width: 2.75rem; min-height: 2.75rem; align-items: center; justify-content: center; cursor: pointer; }
+    .swatch-dot { width: 1.75rem; height: 1.75rem; border-radius: 9999px; background: var(--sw); border: 2px solid transparent; }
+    .swatch-none { background: transparent; border: 2px dashed #64748b; }
+    .swatch input:checked + .swatch-dot { box-shadow: 0 0 0 2px #fff, 0 0 0 4px var(--sw, #0f766e); }
+    html.dark .swatch input:checked + .swatch-dot { box-shadow: 0 0 0 2px #0f172a, 0 0 0 4px var(--sw, #2dd4bf); }
+    .swatch input:focus-visible + .swatch-dot { outline: 3px solid var(--ring); outline-offset: 3px; }
+    .cur-face { display: flex; min-height: 2.75rem; align-items: center; justify-content: space-between; gap: .75rem; padding: .375rem .75rem; cursor: pointer; border-radius: .5rem; }
+    .cur-row:hover .cur-face { background: rgb(100 116 139 / .12); }
+    .cur-row input:checked + .cur-face { background: rgb(15 118 110 / .16); font-weight: 600; }
+    .cur-row input:focus-visible + .cur-face { outline: 3px solid var(--ring); outline-offset: -3px; }
+
+    /* Modal dialogs (native <dialog>: focus trap, Esc, inert page behind) */
+    dialog.sheet { margin: auto; width: min(calc(100% - 2rem), 34rem); max-height: 90dvh; overflow-y: auto; padding: 0;
+      border: 1px solid #e2e8f0; border-radius: 1rem; background: #fff; color: #0f172a; box-shadow: 0 20px 50px rgb(0 0 0 / .3); }
+    dialog.sheet::backdrop { background: rgb(2 6 23 / .6); }
+    html.dark dialog.sheet { border-color: #334155; background: #0f172a; color: #f1f5f9; }
+
+    /* The Save button stays reachable above the bottom nav while the form scrolls */
+    :root { --page-bg: #f8fafc; }
+    html.dark { --page-bg: #020617; }
+    dialog.sheet { --page-bg: #fff; }
+    html.dark dialog.sheet { --page-bg: #0f172a; }
+    .save-bar { position: sticky; z-index: 5; bottom: calc(4.25rem + env(safe-area-inset-bottom)); padding-top: 1rem; margin-top: -.25rem;
+      background: linear-gradient(to top, var(--page-bg) 78%, transparent); }
+    .save-bar.in-dialog { bottom: 0; padding-bottom: 0; }
+    .save-error:not(:empty) { margin-bottom: .5rem; }
+
+    @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+  </style>
+  <style type="text/tailwindcss">
+    @layer components {
+      .card { @apply rounded-2xl border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900; }
+      .card-title { @apply mb-2 text-base font-semibold; }
+      .muted { @apply text-slate-600 dark:text-slate-400; }
+      .field-label { @apply mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300; }
+      .input { @apply min-h-11 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-base text-slate-900 placeholder:text-slate-500 dark:border-slate-600 dark:bg-slate-950 dark:text-slate-100 dark:placeholder:text-slate-400; }
+      .btn-primary { @apply inline-flex min-h-12 items-center justify-center gap-2 rounded-xl bg-teal-700 px-5 py-2 text-base font-semibold text-white hover:bg-teal-800 disabled:opacity-50 dark:bg-teal-400 dark:text-slate-950 dark:hover:bg-teal-300; }
+      .btn-secondary { @apply inline-flex min-h-11 items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2 text-base font-medium text-slate-900 hover:bg-slate-100 disabled:opacity-50 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 dark:hover:bg-slate-800; }
+      .btn-danger { @apply inline-flex min-h-11 items-center justify-center gap-2 rounded-xl border border-rose-400 bg-white px-4 py-2 text-base font-medium text-rose-800 hover:bg-rose-50 disabled:opacity-50 dark:border-rose-700 dark:bg-slate-900 dark:text-rose-300 dark:hover:bg-rose-950; }
+      .btn-link { @apply inline-flex min-h-11 items-center rounded-lg px-2 text-sm font-medium text-teal-800 underline underline-offset-2 hover:bg-slate-100 dark:text-teal-300 dark:hover:bg-slate-800; }
+      .icon-btn { @apply inline-flex min-h-11 min-w-11 items-center justify-center rounded-xl text-slate-700 hover:bg-slate-100 disabled:opacity-30 dark:text-slate-300 dark:hover:bg-slate-800; }
+      .tab { @apply flex min-h-14 flex-col items-center justify-center gap-0.5 text-xs font-medium text-slate-600 dark:text-slate-400; }
+      .tab[aria-current="page"] { @apply text-teal-800 dark:text-teal-300; }
+    }
+  </style>
+</head>
+<body class="min-h-dvh bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100">
+  <a class="skip" href="#main">Skip to content</a>
+
+  <div class="mx-auto w-full max-w-2xl px-4 pb-32" style="padding-top: max(1rem, env(safe-area-inset-top))">
+    <header class="mb-4 flex items-center justify-between">
+      <h1 class="text-xl font-bold tracking-tight">S.E.L.F</h1>
+      <button id="privacy-btn" type="button" class="btn-secondary !px-3" aria-pressed="false"
+              title="Privacy mode hides every amount on screen">
+        <span data-icon="eye" aria-hidden="true"></span><span>Privacy</span>
+      </button>
+    </header>
+
+    <div id="banner"></div>
+
+    <main id="main">
+      <section id="view-add" aria-label="Add a transaction"><div id="entry"></div></section>
+      <section id="view-month" aria-labelledby="h-month" hidden></section>
+      <section id="view-settings" aria-labelledby="h-settings" hidden></section>
+    </main>
+  </div>
+
+  <nav aria-label="Main" class="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 backdrop-blur dark:border-slate-800 dark:bg-slate-900/95"
+       style="padding-bottom: env(safe-area-inset-bottom)">
+    <div class="mx-auto grid max-w-2xl grid-cols-3">
+      <button type="button" class="tab" data-tab="add"><span data-icon="plus" aria-hidden="true"></span>Add</button>
+      <button type="button" class="tab" data-tab="month"><span data-icon="calendar" aria-hidden="true"></span>Month</button>
+      <button type="button" class="tab" data-tab="settings"><span data-icon="cog" aria-hidden="true"></span>Settings</button>
+    </div>
+  </nav>
+
+  <div id="toast" role="status" aria-live="polite" class="pointer-events-none fixed inset-x-0 z-50 flex justify-center px-4"
+       style="bottom: calc(5rem + env(safe-area-inset-bottom))"></div>
+
+  <input id="import-file" type="file" accept=".json,application/json" hidden>
+
+  <noscript>
+    <p class="mx-auto max-w-md p-6 text-center">S.E.L.F needs JavaScript to run. It never sends your data anywhere.</p>
+  </noscript>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
