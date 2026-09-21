@@ -352,6 +352,39 @@ export function removeItem(cats, id, used) {
 }
 
 /**
+ * Move a subcategory to a different parent category.
+ * Useful for consolidating duplicates or reorganizing as your finances evolve.
+ * Existing transactions stay tagged correctly (they reference the subcategory ID, not parent ID).
+ */
+export function moveSubcategoryToParent(cats, subId, newParentId) {
+  const found = locate(cats, subId);
+  if (!found) throw new SchemaError('That category no longer exists.');
+  if (!found.sub) throw new SchemaError('Only subcategories can be moved. Main categories cannot.');
+
+  const newParent = findMain(cats, newParentId);
+  if (!newParent) throw new SchemaError('Target category not found.');
+  if (newParent.type !== found.main.type) throw new SchemaError(`Cannot move between income and expense categories.`);
+  if (newParent.id === found.main.id) throw new SchemaError('Already in this category.');
+
+  // Check for duplicate name in new parent
+  const duplicate = newParent.subs.find((s) => s.name === found.sub.name);
+  if (duplicate) throw new SchemaError(`"${found.sub.name}" already exists in ${newParent.name}. Delete or rename the duplicate first.`);
+
+  const next = clone(cats);
+  const oldMain = findMain(next, found.main.id);
+  const targetParent = findMain(next, newParentId);
+
+  // Remove from old parent
+  const index = oldMain.subs.findIndex((s) => s.id === subId);
+  const [sub] = oldMain.subs.splice(index, 1);
+
+  // Add to new parent
+  targetParent.subs.push(sub);
+
+  return next;
+}
+
+/**
  * Back to the built-in tree. Custom categories that transactions still point to are kept
  * (switched off) so those transactions never lose their label.
  */

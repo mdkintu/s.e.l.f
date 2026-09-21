@@ -1075,7 +1075,7 @@ function itemButtons(cats, item, used, isSub) {
     <button type="button" class="icon-btn" data-act="move" data-dir="-1" data-id="${item.id}" data-key="up:${item.id}" aria-label="Move ${item.name} up" ${pos.index === 0 ? 'disabled' : ''}>${icon('up')}</button>
     <button type="button" class="icon-btn" data-act="move" data-dir="1" data-id="${item.id}" data-key="down:${item.id}" aria-label="Move ${item.name} down" ${pos.index === pos.count - 1 ? 'disabled' : ''}>${icon('down')}</button>
     <button type="button" class="icon-btn" data-act="rename" data-id="${item.id}" data-key="ren:${item.id}" aria-label="Rename or restyle ${item.name}">${icon('pencil')}</button>
-    ${item.custom ? html`<button type="button" class="icon-btn ${inUse ? 'opacity-40' : ''}" data-act="delete-item" data-id="${item.id}" data-key="rm:${item.id}" aria-label="Delete ${item.name}${inUse ? ' (has transactions, hide it instead)' : ''}">${icon('trash')}</button>` : ''}`;
+    ${item.custom ? html`<button type="button" class="icon-btn" data-act="delete-item" data-id="${item.id}" data-key="rm:${item.id}" aria-label="Delete ${item.name}${inUse ? ' (has transactions, hide it instead)' : ''}" title="${inUse ? 'Cannot delete: this category has transactions. Hide it instead, or move transactions elsewhere first.' : 'Delete this category'}" ${inUse ? 'disabled' : ''}>${icon('trash')}</button>` : ''}`;
 }
 
 function mainCardHtml(cats, main, used) {
@@ -1177,6 +1177,12 @@ function settingsHtml() {
         ${store.isEncrypted() ? html`<p class="mt-3 text-sm muted">A <strong>.self</strong> file opens with this passphrase on any device. The JSON and CSV files are plain text that anyone can read — treat them like cash.</p>` : ''}
         <p class="mt-3 text-sm muted">${plural(live, 'transaction')} on this device · about ${kb} KB used of roughly 5 MB.</p>
       </section>
+
+      <section class="card" aria-labelledby="s-reset">
+        <h3 id="s-reset" class="card-title">Data Management</h3>
+        <p class="mb-3 text-sm muted">Delete transactions from a specific time period. This cannot be undone, so export a backup first.</p>
+        <button type="button" class="btn-danger" data-act="reset-data" data-key="reset-data">Delete transactions by date…</button>
+      </section>
     </div>`;
 }
 
@@ -1229,13 +1235,25 @@ function swatchesHtml(name, current) {
 }
 
 /** Dialog for "Add custom field" (sub-category or main category) and for rename/restyle. */
-async function itemDialog({ item = null, type = 'expense', parentId = '' }) {
+async function itemDialog({ item = null, type = 'expense', parentId = '', isSubcategory = false }) {
   const editing = Boolean(item);
   const cats = store.getCategories();
   let kind = type;
+  const currentParent = isSubcategory ? cats.find(m => m.subs?.some(s => s.id === item?.id))?.id : parentId;
+
   const { dlg, done } = mountDialog(html`
     <form class="space-y-4 p-5" novalidate autocomplete="off">
-      <h2 id="dlg-title" class="text-lg font-semibold">${editing ? `Rename or restyle "${item.name}"` : 'Add custom field'}</h2>
+      <h2 id="dlg-title" class="text-lg font-semibold">${editing ? `Rename, restyle or move "${item.name}"` : 'Add custom field'}</h2>
+      ${editing && isSubcategory ? html`
+        <div>
+          <label class="field-label" for="af-move-parent">Move to category <span class="font-normal muted">(optional)</span></label>
+          <select id="af-move-parent" class="input">
+            <option value="">— Keep in current category —</option>
+            ${cats.filter((m) => m.type === kind).map((m) => html`<option value="${m.id}" ${m.id === currentParent ? 'disabled' : ''}>${m.emoji} ${m.name}${m.id === currentParent ? ' (current)' : ''}</option>`)}
+          </select>
+          <p class="mt-1 text-xs muted">Reorganize this category. Existing transactions stay correctly tagged.</p>
+        </div>
+      ` : ''}
       ${editing ? '' : html`
         <fieldset>
           <legend class="field-label">Type</legend>
@@ -1264,7 +1282,9 @@ async function itemDialog({ item = null, type = 'expense', parentId = '' }) {
     </form>`);
 
   const parentEl = $('#af-parent', dlg);
+  const moveParentEl = $('#af-move-parent', dlg);
   const errorEl = $('#af-error', dlg);
+
   if (!editing) {
     const drawParents = (selected) => {
       put(parentEl, html`
@@ -1287,7 +1307,18 @@ async function itemDialog({ item = null, type = 'expense', parentId = '' }) {
     try {
       let next;
       if (editing) {
-        next = schema.updateItem(cats, item.id, values);
+        // Check if user wants to move this subcategory
+        const newParentId = moveParentEl?.value;
+        if (newParentId && isSubcategory) {
+          next = schema.moveSubcategoryToParent(cats, item.id, newParentId);
+          const newParent = next.find(m => m.id === newParentId);
+          ui.openMains.add(newParentId);
+          ui.openMains.add(currentParent); // Keep old parent visible if it was
+        } else {
+          next = cats;
+        }
+        // Always update the item's metadata
+        next = schema.updateItem(next, item.id, values);
       } else if (parentEl.value === '__new') {
         next = schema.addMain(cats, { type: kind, ...values });
         const created = next.find((m) => !cats.some((c) => c.id === m.id));
@@ -1337,13 +1368,15 @@ function wireSettings() {
       case 'toggle-item': {
         const on = btn.getAttribute('aria-checked') === 'true';
         guard(() => store.saveCategories(schema.updateItem(cats, id, { enabled: !on })));
+        renderSettings();
         break;
       }
       case 'move': guard(() => store.saveCategories(schema.moveItem(cats, id, Number(btn.dataset.dir)))); break;
       case 'rename': {
         const main = schema.findMain(cats, id);
         const sub = main ? null : cats.flatMap((m) => m.subs).find((s) => s.id === id);
-        await itemDialog({ item: main ?? sub });
+        const isSubcategory = !main && !!sub;
+        await itemDialog({ item: main ?? sub, isSubcategory });
         break;
       }
       case 'delete-item': {
@@ -1356,6 +1389,8 @@ function wireSettings() {
         }
         if (await confirmDialog({ title: `Delete "${item.name}"?`, message: 'No transaction uses it, so it can be removed for good. This can\'t be undone.', confirmLabel: 'Delete', danger: true })) {
           guard(() => store.saveCategories(schema.removeItem(store.getCategories(), id, schema.usedCategoryIds(store.getTransactions()))));
+          renderSettings();
+          toast(`Deleted "${item.name}"`);
         }
         break;
       }
@@ -1382,6 +1417,7 @@ function wireSettings() {
       case 'export-json': exportJson(); break;
       case 'export-csv': exportCsv(); break;
       case 'import': $('#import-file').click(); break;
+      case 'reset-data': await resetDataFlow(); break;
       default: break;
     }
   });
@@ -1482,6 +1518,94 @@ async function changePassphraseFlow() {
 function exportCsv() {
   const csv = buildCsv(store.getState());
   download(`self-transactions-${stamp()}.csv`, csv, 'text/csv;charset=utf-8');
+}
+
+async function resetDataFlow() {
+  const today = new Date();
+  const { dlg, done } = mountDialog(html`
+    <form class="space-y-4 p-5" novalidate>
+      <h2 id="dlg-title" class="text-lg font-semibold">Delete transactions by date</h2>
+      <p class="text-sm muted">Select how many months back to delete. All transactions in the selected period will be permanently removed.</p>
+      <div>
+        <label class="field-label" for="reset-months">Delete transactions from the last</label>
+        <div class="flex items-end gap-2">
+          <select id="reset-months" class="input flex-1" required>
+            <option value="">—</option>
+            <option value="1">1 month</option>
+            <option value="3">3 months</option>
+            <option value="6">6 months</option>
+            <option value="12">12 months</option>
+            <option value="24">24 months</option>
+            <option value="all">ALL DATA</option>
+          </select>
+        </div>
+      </div>
+      <div id="reset-preview" class="p-3 bg-rose-50 dark:bg-rose-950 rounded border border-rose-200 dark:border-rose-800 text-sm hidden">
+        <p class="font-medium mb-1" id="reset-count"></p>
+        <p id="reset-dates" class="text-xs muted"></p>
+      </div>
+      <p id="reset-error" role="alert" class="text-sm font-medium text-rose-700 dark:text-rose-300 min-h-5"></p>
+      <div class="flex justify-end gap-2">
+        <button type="button" class="btn-secondary" data-close="">Cancel</button>
+        <button type="submit" id="reset-confirm" class="btn-danger" disabled>Delete</button>
+      </div>
+    </form>`);
+
+  const monthsEl = $('#reset-months', dlg);
+  const previewEl = $('#reset-preview', dlg);
+  const countEl = $('#reset-count', dlg);
+  const datesEl = $('#reset-dates', dlg);
+  const errorEl = $('#reset-error', dlg);
+  const confirmEl = $('#reset-confirm', dlg);
+
+  function updatePreview() {
+    const months = parseInt(monthsEl.value, 10);
+    if (!months && monthsEl.value !== 'all') {
+      previewEl.classList.add('hidden');
+      confirmEl.disabled = true;
+      return;
+    }
+
+    const cutoff = months === 0 ? new Date(0) : new Date(today.getFullYear(), today.getMonth() - months, today.getDate());
+    const all = store.getTransactions();
+    const toDelete = all.filter((t) => new Date(t.date) >= cutoff && !t.deleted);
+
+    countEl.textContent = `${plural(toDelete.length, 'transaction')} will be deleted`;
+    if (months === 'all' || !months) {
+      datesEl.textContent = 'Entire database';
+    } else {
+      datesEl.textContent = `From ${cutoff.toLocaleDateString()} onwards`;
+    }
+    previewEl.classList.remove('hidden');
+    confirmEl.disabled = false;
+  }
+
+  monthsEl.addEventListener('change', updatePreview);
+
+  dlg.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const months = parseInt(monthsEl.value, 10);
+      if (!months && monthsEl.value !== 'all') throw new Error('Select a time period');
+
+      const cutoff = monthsEl.value === 'all' ? new Date(0) : new Date(today.getFullYear(), today.getMonth() - months, today.getDate());
+      const all = store.getTransactions();
+      const toDelete = all.filter((t) => new Date(t.date) >= cutoff && !t.deleted);
+
+      if (!toDelete.length) throw new Error('No transactions to delete in this period');
+
+      // Show final confirmation
+      if (!confirm(`Delete ${toDelete.length} transaction${toDelete.length === 1 ? '' : 's'}? This cannot be undone.`)) return;
+
+      for (const t of toDelete) store.deleteTransaction(t.id);
+      toast(`Deleted ${plural(toDelete.length, 'transaction')}`);
+      renderMonth();
+      done();
+    } catch (err) {
+      if (isFriendly(err)) errorEl.textContent = err.message;
+      else throw err;
+    }
+  });
 }
 
 const MAX_IMPORT_BYTES = 25 * 1024 * 1024;
