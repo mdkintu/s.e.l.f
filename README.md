@@ -1,4 +1,4 @@
-# S.E.L.F
+# S.E.L.F — Secure Encrypted Ledger Finance
 
 A private, local-first personal finance tracker.
 
@@ -21,7 +21,21 @@ python3 -m http.server 8000     # or: npx serve
 > `localhost`. Opened from a `file://` path, or over plain `http://` from another machine, the
 > app still runs but Settings will say encryption is unavailable. Deploy over https.
 
-Deploy by uploading the files as-is to Vercel or Netlify.
+### Deploy
+
+**Option 1: Namecheap (or any shared hosting)**
+
+Upload these folders to `public_html/` via FTP or your host's file manager:
+- `index.html`
+- `js/` folder
+- `vendor/` folder  
+- `supabase/` folder
+
+Then visit your domain. HTTPS is required for encryption to work.
+
+**Option 2: Netlify or Vercel**
+
+Push to GitHub and import your repo. Both platforms auto-deploy on every push.
 
 > **First load needs a network connection** for the Tailwind CDN script. After that the app itself makes no network calls. Vendor Tailwind locally (and add a service worker) when you want true offline first-load.
 

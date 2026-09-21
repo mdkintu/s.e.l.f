@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
-  <meta name="description" content="S.E.L.F is a private, local-first personal finance tracker. No account, no network calls: your data stays on your device.">
+  <meta name="description" content="S.E.L.F (Secure Encrypted Ledger Finance): a private, local-first personal finance tracker. No account, no network calls: your data stays on your device.">
   <!--
     The browser itself enforces "nothing leaves the device": connect-src 'none' blocks every
     fetch/XHR/WebSocket FROM THIS PAGE, and scripts may only come from this site plus the Tailwind CDN.
@@ -125,7 +125,10 @@
 
   <div id="app-shell" class="mx-auto w-full max-w-2xl px-4 pb-32" style="padding-top: max(1rem, env(safe-area-inset-top))">
     <header class="mb-4 flex items-center justify-between">
-      <h1 class="text-xl font-bold tracking-tight">S.E.L.F</h1>
+      <div>
+        <h1 class="text-xl font-bold tracking-tight">S.E.L.F</h1>
+        <p class="text-xs text-gray-600 dark:text-gray-400">Secure Encrypted Ledger Finance</p>
+      </div>
       <button id="privacy-btn" type="button" class="btn-secondary !px-3" aria-pressed="false"
               title="Privacy mode hides every amount on screen">
         <span data-icon="eye" aria-hidden="true"></span><span>Privacy</span>
@@ -161,7 +164,7 @@
   <input id="import-file" type="file" accept=".json,.self,application/json,application/octet-stream" hidden>
 
   <noscript>
-    <p class="mx-auto max-w-md p-6 text-center">S.E.L.F needs JavaScript to run. It never sends your data anywhere.</p>
+    <p class="mx-auto max-w-md p-6 text-center">S.E.L.F (Secure Encrypted Ledger Finance) needs JavaScript to run. It never sends your data anywhere.</p>
   </noscript>
 
   <script type="module" src="js/app.js"></script>
