@@ -110,16 +110,18 @@ export function formatCompact(minor, code) {
 export function parseAmount(input, decimals) {
   const s = String(input ?? '').replace(/[\s  ']/g, '');
   if (s === '') return { error: 'empty' };
-  if (!/^[\d.,]+$/.test(s) || !/\d/.test(s)) return { error: 'invalid' };
+  if (!/^-?[\d.,]+$/.test(s) || !/\d/.test(s)) return { error: 'invalid' };
 
-  let intDigits = s.replace(/[.,]/g, '');
+  const isNegative = s.startsWith('-');
+  const unsignedS = isNegative ? s.slice(1) : s;
+  let intDigits = unsignedS.replace(/[.,]/g, '');
   let frac = '';
-  const last = Math.max(s.lastIndexOf('.'), s.lastIndexOf(','));
+  const last = Math.max(unsignedS.lastIndexOf('.'), unsignedS.lastIndexOf(','));
   if (last !== -1) {
-    const sep = s[last];
+    const sep = unsignedS[last];
     const other = sep === '.' ? ',' : '.';
-    const before = s.slice(0, last);
-    const after = s.slice(last + 1);
+    const before = unsignedS.slice(0, last);
+    const after = unsignedS.slice(last + 1);
     let isDecimal;
     if (before.includes(sep)) {
       if (before.includes(other)) return { error: 'invalid' }; // "1.2,3.4"
@@ -140,9 +142,10 @@ export function parseAmount(input, decimals) {
 
   const digits = `${intDigits || '0'}${frac.padEnd(decimals, '0')}`.replace(/^0+(?=\d)/, '');
   if (digits.length > 15) return { error: 'too-large' };
-  const minor = Number(digits);
+  let minor = Number(digits);
   if (minor === 0) return { error: 'zero' };
   if (minor > MAX_MINOR) return { error: 'too-large' };
+  if (isNegative) minor = -minor;
   return { minor };
 }
 
