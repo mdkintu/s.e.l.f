@@ -15,8 +15,8 @@
 // If you ever paste one here by mistake, treat it as leaked and rotate it in the dashboard.
 
 export const SUPABASE = {
-  url: '',
-  anonKey: '',
+  url: 'https://agdfvmccbvgyiwznxcob.supabase.co',
+  anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFnZGZ2bWNjYnZneWl3em54Y29iIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk5MTk4MjEsImV4cCI6MjEwNTQ5NTgyMX0.d2Iyjfeq_9dIGbPNLEU8QVZqE8pbvYwH7PQva3sq8Sc',
 };
 
 /** The table from supabase/schema.sql. */
