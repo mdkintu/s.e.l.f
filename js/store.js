@@ -127,7 +127,7 @@ function cleanTransaction(raw) {
   if (!raw || typeof raw !== 'object') return { reason: 'not an object' };
   if (typeof raw.id !== 'string' || !/^[A-Za-z0-9-]{8,64}$/.test(raw.id)) return { reason: 'bad id' };
   if (raw.type !== 'income' && raw.type !== 'expense') return { reason: 'bad type' };
-  if (!Number.isSafeInteger(raw.amount) || raw.amount <= 0) return { reason: 'amount must be a whole number above zero' };
+  if (!Number.isSafeInteger(raw.amount) || raw.amount === 0) return { reason: 'amount must be a whole number, not zero' };
   if (!isCurrencyCode(raw.currency)) return { reason: 'bad currency' };
   if (typeof raw.categoryId !== 'string' || !raw.categoryId) return { reason: 'no category' };
   if (raw.subCategoryId != null && typeof raw.subCategoryId !== 'string') return { reason: 'bad sub-category' };

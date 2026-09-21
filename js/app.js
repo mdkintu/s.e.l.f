@@ -82,7 +82,9 @@ const currencyCode = () => store.getSettings().currency;
 /** Amount as HTML. With Privacy Mode on, no digits reach the DOM at all. */
 function amountHtml(minor, sign = '') {
   if (privacyOn()) return html`<span aria-hidden="true">••••</span><span class="sr-only">amount hidden</span>`;
-  return html`${sign}${money.formatMoney(minor, currencyCode())}`;
+  // If amount is negative, it has its own sign; ignore the provided sign
+  const displaySign = minor < 0 ? '' : sign;
+  return html`${displaySign}${money.formatMoney(minor, currencyCode())}`;
 }
 
 /* ---------- errors ---------- */
